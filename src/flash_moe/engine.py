@@ -38,8 +38,10 @@ class MoEEngine:
         combined_output = np.zeros(self.hidden_size, dtype=np.float32)
         for expert_id, weight in zip(expert_ids, weights):
             key = ExpertKey(layer, expert_id)
-            self.store.get(key) # Ensures expert is resident in RAM / prefetch completed
+            # No store.get() here: it would concatenate the whole expert just
+            # to throw it away. backend.forward() -> store.read_tensor() takes
+            # the prefetch path and only pulls the tensor it needs.
             expert_out = self.backend.forward(key, activation, self.hidden_size, self.intermediate_size)
-            combined_output += weight * np.array(expert_out, dtype=np.float32)
+            combined_output += weight * np.asarray(expert_out, dtype=np.float32)
 
         return combined_output.tolist()
