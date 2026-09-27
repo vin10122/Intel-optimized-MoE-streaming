@@ -57,6 +57,10 @@ scratch/
 
 # Logs
 *.log
+bench_phases_out.txt
+
+# Kilo agent manager (worktrees + stato sessioni)
+.kilo/
 
 # Jupyter
 .ipynb_checkpoints/
