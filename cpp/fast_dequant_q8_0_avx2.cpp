@@ -32,11 +32,13 @@ struct block_q8_0 {
 /*
  * Convert 8 float32 values to 8 bfloat16 using AVX2
  * BF16: sign bit + 7 exponent bits + 7 mantissa bits (truncated from FP32)
+ * We process 8 floats at a time (from the low 256 bits of the __m256)
  */
 static inline void fp32_to_bf16_8(const __m256& v_fp32, uint16_t* out_bf16) {
-    // Extract high 128 bits (sign + exponent + first 7 mantissa bits)
-    __m128i v_int = _mm256_castps_si256(v_fp32);
-    __m128i hi_128 = _mm_srli_epi32(v_int, 16);
+    // Extract the low 128 bits (first 4 floats)
+    __m128i v_int_lo = _mm256_castps256_si256(v_fp32);
+    // Shift right by 16 to get bfloat16 (discard lower 16 bits of mantissa)
+    __m128i hi_128 = _mm_srli_epi32(v_int_lo, 16);
     
     // Pack to 128 bits
     __m128i packed = _mm_packus_epi32(hi_128, _mm_setzero_si128());

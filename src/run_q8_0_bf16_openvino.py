@@ -172,6 +172,7 @@ class Q8_0_BF16_Backend:
                     rows, 
                     cols
                 )
+                print(f"[DEQUANT] C++ AVX2: {rows}x{cols}", flush=True)
             else:
                 _cpp_dequant_q8_0.dequantize_q8_0_to_bf16(
                     raw_bytes, 
@@ -179,9 +180,11 @@ class Q8_0_BF16_Backend:
                     rows, 
                     cols
                 )
+                print(f"[DEQUANT] C++ OpenMP: {rows}x{cols}", flush=True)
             return dst
         else:
             # Fallback Python
+            print(f"[DEQUANT] Python fallback: {rows}x{cols}", flush=True)
             raw_arr = np.frombuffer(raw_bytes, dtype=np.uint8)
             dequant = gguf.quants.dequantize(raw_arr, GGMLQuantizationType.Q8_0).astype(np.float32)
             # Converti FP32 a BF16 (semplicemente troncando)

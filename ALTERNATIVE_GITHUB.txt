@@ -1,0 +1,90 @@
+METODI ALTERNATIVI PER CREARE REPO SU GITHUB
+==============================================
+
+
+METODO A: Usando il browser (più semplice)
+----------------------------------------
+1. Apri Chrome/Firefox
+2. Vai su: https://github.com/new
+
+3. Compila il form:
+   - Repository name: flash-moe-q8
+   - Description: FLASH-MOE: Q8_0 to BF16 Optimized Inference for Intel Lunar Lake
+   - Public/Private: Seleziona PRIVATE
+   - Add .gitignore: NO (abbiamo già il nostro)
+   - Add a README: NO (abbiamo già il nostro)
+   - Add a license: MIT (opzionale)
+
+4. Clicca il pulsante verde "Create repository"
+
+5. Dopo aver creato il repo, segui le istruzioni in CREA_REPO_GITHUB.txt
+
+
+METODO B: Usando la CLI (se hai GitHub CLI)
+---------------------------------------------
+Installazione (se non ce l'hai):
+   winget install --id GitHub.cli  (su Windows)
+
+Poi:
+   gh auth login
+   gh repo create flash-moe-q8 --private --no-gitignore --no-readme
+   cd C:\Users\valer\Desktop\moe-client-prot\Nuova cartella
+   git remote add origin git@github.com:TUO_USERNAME/flash-moe-q8.git
+   git push -u origin master
+
+
+METODO C: Usando curl (API GitHub)
+----------------------------------
+Se hai un Personal Access Token (PAT):
+
+1. Crea un PAT su: https://github.com/settings/tokens
+   (seleziona: repo, write:org se necessario)
+
+2. Esegui:
+   curl -X POST \
+     -H "Authorization: token TUO_TOKEN" \
+     -H "Accept: application/vnd.github+json" \
+     https://api.github.com/user/repos \
+     -d '{"name":"flash-moe-q8","private":true,"description":"FLASH-MOE: Q8_0 to BF16 Optimized Inference"}'
+
+3. Poi:
+   git remote add origin https://github.com/TUO_USERNAME/flash-moe-q8.git
+   git push -u origin master
+
+
+METODO D: Da questa finestra (copia-incolla)
+-------------------------------------------
+Se hai già un repo su GitHub, puoi fare:
+
+1. Copia l'URL del tuo repo (es: https://github.com/TUO_USERNAME/flash-moe-q8.git)
+2. Esegui questi comandi:
+
+   cd C:\Users\valer\Desktop\moe-client-prot\Nuova cartella
+   git remote add origin PASTA_REPO_URL
+   git push -u origin master
+
+
+RISOLUZIONE PROBLEMI
+-------------------
+
+Problema: "remote origin already exists"
+Soluzione: git remote remove origin
+
+Problema: "Authentication failed"
+Soluzione: Usa un Personal Access Token (PAT) come password
+
+Problema: "Repository not found"
+Soluzione: Controlla che il repo esista e che l'URL sia corretta
+
+
+VERIFICA FINALE
+---------------
+Dopo il push, verifica con:
+   git remote -v
+   git log --oneline
+   git status
+
+Dovresti vedere:
+   - origin  https://github.com/TUO_USERNAME/flash-moe-q8.git
+   - 1 commit
+   - nothing to commit, working tree clean

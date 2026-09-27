@@ -1,0 +1,76 @@
+CREAZIONE REPO GITHUB PRIVATO
+=================================
+
+PASSO 1: Crea repo su GitHub
+---------------------------
+1. Vai su https://github.com/new
+2. Inserisci:
+   - Repository name: flash-moe-q8
+   - Description: FLASH-MOE: Q8_0 to BF16 Optimized Inference
+   - Private: ✓ (selezionato)
+   - Initialize with README: ✗ (NO, abbiamo già il nostro)
+   - .gitignore: ✗ (NO, abbiamo già il nostro)
+   - License: MIT (opzionale)
+3. Clicca "Create repository"
+
+
+PASSO 2: Aggiungi remote e push
+------------------------------
+Apri terminale nella cartella del progetto e esegui:
+
+```bash
+# Aggiungi remote (sostituisci YOUR_USERNAME con il tuo)
+git remote add origin https://github.com/YOUR_USERNAME/flash-moe-q8.git
+
+# Verifica
+git remote -v
+
+# Push su GitHub
+git push -u origin master
+```
+
+
+PASSO 3: Verifica
+-----------------
+1. Vai su https://github.com/YOUR_USERNAME/flash-moe-q8
+2. Controlla che tutti i file siano presenti
+3. Il repo dovrebbe contenere:
+   - README.md
+   - requirements.txt
+   - .gitignore
+   - cpp/ (4 file .cpp)
+   - src/ (flash_moe/ e run_q8_0_bf16_openvino.py)
+   - scripts/ (2 file .bat)
+   - docs/ (COMPILA_CPP.txt)
+
+
+STRUTTURA DEL REPO
+------------------
+flash-moe-q8/
+├── .gitignore
+├── README.md
+├── requirements.txt
+├── cpp/
+│   ├── fast_dequant.cpp
+│   ├── fast_dequant_avx2.cpp
+│   ├── fast_dequant_q8_0.cpp
+│   └── fast_dequant_q8_0_avx2.cpp
+├── scripts/
+│   ├── compile_dequant_q8_0.bat
+│   └── compile_dequant_q8_0_full.bat
+├── src/
+│   ├── flash_moe/
+│   │   ├── __init__.py
+│   │   ├── backend_ov.py
+│   │   ├── engine.py
+│   │   ├── key.py
+│   │   ├── manifest.py
+│   │   ├── router.py
+│   │   ├── store.py
+│   │   └── utils.py
+│   └── run_q8_0_bf16_openvino.py
+└── docs/
+    └── COMPILA_CPP.txt
+
+
+NOTA: I file .gguf (35GB) sono ESCLUSI dal .gitignore e non verranno caricate su GitHub.
