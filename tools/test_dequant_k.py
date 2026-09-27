@@ -92,7 +92,13 @@ def synth_blocks(type_name: str, n_blocks: int) -> np.ndarray:
     if type_name == "Q8_0":
         for b in range(n_blocks):
             put_f16(data, b * bpb, float(rng.uniform(0.001, 0.05)))
-    elif type_name in ("Q3_K", "Q4_K", "Q5_K"):
+    elif type_name == "Q3_K":
+        # Q3_K non ha dmin: 110 B con hmask[32], qs[64], scales[12], f16 d a 108.
+        # Scrivere d a offset 0 (layout Q4_K/Q5_K) lascia un f16 casuale che
+        # nel f16 sfora e il test segnala inf anche se il kernel e' corretto.
+        for b in range(n_blocks):
+            put_f16(data, b * bpb + 108, float(rng.uniform(0.01, 0.5)))
+    elif type_name in ("Q4_K", "Q5_K"):
         for b in range(n_blocks):
             blk = b * bpb
             put_f16(data, blk, float(rng.uniform(0.01, 0.5)))

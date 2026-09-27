@@ -28,6 +28,9 @@
 #include <cstring>
 #include <immintrin.h>
 
+/* Mappature misurate da tools/derive_k_tables.py, non derivate a mano. */
+#include "dequant_k_tables.h"
+
 #define QK_K 256
 
 #define GGML_TYPE_Q8_0 8
@@ -49,12 +52,16 @@ static inline float f16_to_f32(uint16_t h) {
         if (man == 0) {
             bits = sign;                       /* +/- zero */
         } else {
-            /* subnormale f16 -> f32 normalizzato */
+            /* subnormale f16 -> f32 normalizzato.
+             * man * 2^-24, e shift per portare il bit 10 in testa: valore
+             * = (1 + frac) * 2^(-14 - e), quindi esponente biased = 113 - e.
+             * Con 112 - e si perde un fattore 2: 0x200 -> 2^-16 invece di
+             * 2^-15. */
             uint32_t e = 0;
             uint32_t m = man;
             while ((m & 0x400u) == 0) { m <<= 1; ++e; }
             m &= 0x3FFu;
-            bits = sign | ((127 - 15 - e) << 23) | (m << 13);
+            bits = sign | ((113u - e) << 23) | (m << 13);
         }
     } else if (exp == 0x1Fu) {
         bits = sign | 0x7F800000u | (man << 13);   /* inf / nan */
@@ -166,39 +173,35 @@ static void dequant_q4_k(const uint8_t* src, float* dst, int64_t nblocks) {
 }
 
 /* ------------------------------------------------------------------ Q5_K --- */
-/* 176 B: f16 d, f16 dmin, scales[12], qh[32], qs[128].
- * come Q4_K ma q ha 5 bit: q = (nibble) | (((qh[byte] >> bit) & 1) << 4) */
-
+/* 176 B: f16 d @0, f16 dmin @2, scales[12] @4, qh[32] @16, qs[128] @48.
+ *
+ *   y[i] = d * sc[i/32] * q[i] - dmin * mn[i/32]
+ *
+ * Il termine -dmin*mn e' una costante del sub-blocco, non un secondo campo
+ * quantizzato. Le scale usano lo stesso impaccamento di Q4_K
+ * (unpack_scale_min_k4): per j >= 4 i due bit alti arrivano da s[j-4] >> 6 e
+ * non vanno persi, altrimenti metà dei sub-blocchi torna sbagliato.
+ *
+ * q e' un intero a 5 bit: ql a offset 0 (4 bit, qs @48) e qh a offset 4
+ * (1 bit, qh @16). L'interlacciamento dei due byte e' misurato, non derivato.
+ */
 static void dequant_q5_k(const uint8_t* src, float* dst, int64_t nblocks) {
     for (int64_t b = 0; b < nblocks; ++b) {
         const uint8_t* blk = src + b * 176;
         const float d = f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
         const float dmin = f16_to_f32((uint16_t)(blk[2] | (blk[3] << 8)));
-        const uint8_t* qh = blk + 16;
-        const uint8_t* qs = blk + 48;
 
         uint8_t sc[8], mn[8];
         unpack_scale_min_k4(blk + 4, sc, mn);
 
         float* out = dst + b * QK_K;
-        int is = 0;
-        for (int g = 0; g < 4; ++g) {
-            const uint8_t h = qh[g];
-            const float d1 = d * (float)sc[is + 0];
-            const float m1 = dmin * (float)mn[is + 0];
-            const float d2 = d * (float)sc[is + 1];
-            const float m2 = dmin * (float)mn[is + 1];
-            for (int l = 0; l < 32; ++l) {
-                const uint8_t q = (uint8_t)((qs[l] & 0x0F) | (((h >> l) & 1) << 4));
-                out[l] = d1 * (float)q - m1;
-            }
-            for (int l = 0; l < 32; ++l) {
-                const uint8_t q = (uint8_t)((qs[l] >> 4) | (((h >> l) & 1) << 4));
-                out[32 + l] = d2 * (float)q - m2;
-            }
-            out += 64;
-            qs += 32;
-            is += 2;
+        for (int i = 0; i < QK_K; ++i) {
+            const int j = i >> 5;
+            const int q = (int)((blk[Q5_K_B1[i]] >> Q5_K_S1[i]) & ((1u << Q5_K_W1[i]) - 1u))
+                        << Q5_K_O1[i]
+                        | (int)((blk[Q5_K_B2[i]] >> Q5_K_S2[i]) & ((1u << Q5_K_W2[i]) - 1u))
+                        << Q5_K_O2[i];
+            out[i] = d * (float)sc[j] * (float)q - dmin * (float)mn[j];
         }
     }
 }
@@ -215,8 +218,6 @@ static void dequant_q5_k(const uint8_t* src, float* dst, int64_t nblocks) {
  *   B2/S2 -> campo a 2 bit, in qh[128..191]
  *   q = (low4 | (high2 << 4)) - 32,   y = d * scales[i/16] * q
  */
-#include "dequant_k_tables.h"
-
 static void dequant_q6_k(const uint8_t* src, float* dst, int64_t nblocks) {
     for (int64_t b = 0; b < nblocks; ++b) {
         const uint8_t* blk = src + b * 210;
