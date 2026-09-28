@@ -1,6 +1,7 @@
 from .key import ExpertKey, StoreStats
 from .manifest import ExpertManifest, ExpertRecord, ExpertTensorSlice
 from .store import ExpertStore, RAMBoundedExpertStore, AsyncExpertStore
+from .paths import MODEL_FILENAME, dll_path, model_path, require_model
 from .dequant import (
     GGML_BLOCK_INFO,
     dequantize,
@@ -23,6 +24,10 @@ __all__ = [
     "ExpertStore",
     "RAMBoundedExpertStore",
     "AsyncExpertStore",
+    "MODEL_FILENAME",
+    "dll_path",
+    "model_path",
+    "require_model",
     "GGML_BLOCK_INFO",
     "dequantize",
     "dequantize_to",

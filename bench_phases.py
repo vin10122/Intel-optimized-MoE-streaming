@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -24,8 +25,14 @@ import gguf
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
-GGUF_PATH = ROOT / "Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf"
-DLL_Q8 = ROOT / "flash_moe" / "fast_dequant_q8_0.dll"
+sys.path.insert(0, str(ROOT / "src"))
+
+from flash_moe.paths import dll_path, model_path  # noqa: E402
+from flash_moe.dequant import name_of  # noqa: E402
+
+GGUF_PATH = model_path()
+GGML_ID = {v: k for k, v in vars(gguf.GGMLQuantizationType).items()
+           if isinstance(v, int) and not k.startswith("_")}
 
 HIDDEN = 2048
 INTER = 512
@@ -110,25 +117,34 @@ def main() -> None:
           f"({np.abs(w16.astype(np.float32) - w32).max() / w_max:.2e} rel)")
 
     try:
-        dll = ctypes.CDLL(str(DLL_Q8))
-        dll.dequantize_q8_0_to_bf16.argtypes = [
-            ctypes.c_char_p,
-            ctypes.POINTER(ctypes.c_uint16),
+        # La DLL validata (gate 162/162) invece della vecchia fast_dequant_q8_0,
+        # che era numericamente errata e non piu' esiste.
+        dll = ctypes.CDLL(str(dll_path()))
+        dll.dequant_k.argtypes = [
             ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_void_p,
+            ctypes.c_int64,
             ctypes.c_int,
         ]
-        dll.dequantize_q8_0_to_bf16.restype = None
-        dst = np.empty((HIDDEN, INTER), dtype=np.uint16)
+        dll.dequant_k.restype = ctypes.c_int
+        n_el = HIDDEN * INTER
+        dst16 = np.empty(n_el, dtype=np.uint16)
 
         def call_cpp():
-            dll.dequantize_q8_0_to_bf16(
-                gate_bytes, dst.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
-                HIDDEN, INTER,
+            rc = dll.dequant_k(
+                GGML_ID["Q4_K"],
+                gate_bytes.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                dst16.ctypes.data, n_el, 1,
             )
+            if rc != 0:
+                raise RuntimeError(f"dequant_k ha restituito rc={rc}")
 
-        bench("DLL C++ esistente (kernel Q8_0 su dati Q4_K: non confrontabile)",
-              call_cpp, repeat=20, warmup=5)
-        print("  -> ordine di grandezza utile: ~0.3 ms per 1M elementi")
+        ms_dll, w_dll = bench("DLL C++ validata (dequant_k, Q4_K -> float16)",
+                              call_cpp, repeat=20, warmup=5)
+        got = dst16.view(np.float16).astype(np.float32)
+        err = np.abs(got - w32).max() / w_max
+        print(f"  -> {ms_dll:.3f} ms, errore relativo vs gguf.quants: {err:.3e}")
     except Exception as err:
         print(f"  [DLL non caricabile: {err}]")
 

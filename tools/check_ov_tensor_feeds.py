@@ -9,16 +9,19 @@ Qual e' il modo corretto? Prova:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from flash_moe.paths import model_path  # noqa: E402
+
 HIDDEN = 512
 INTER = 256
-GGUF_PATH = (
-    r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella"
-    r"\Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf"
-)
+GGUF_PATH = model_path()
 
 
 def build(core, device, wtype):

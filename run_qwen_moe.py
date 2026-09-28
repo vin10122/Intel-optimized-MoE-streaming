@@ -1,7 +1,11 @@
 import time
+import sys
 import numpy as np
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+# Il pacchetto vive in src/: e' l'unica copia, la radice non ne ha piu'.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from flash_moe import (
     ExpertKey,

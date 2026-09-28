@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import os
 import platform
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import gguf
 import numpy as np
 
-GGUF_PATH = Path(
-    r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella"
-    r"\Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf"
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from flash_moe.paths import model_path  # noqa: E402
+
+GGUF_PATH = model_path()
 
 # ggml type -> (block_size, bytes_per_block)
 TYPE_INFO = {
