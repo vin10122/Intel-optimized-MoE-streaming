@@ -1,78 +1,159 @@
+"""Backend OpenVINO per l'esecuzione SwiGLU di un singolo expert.
+
+Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precisions.py):
+
+* **f16, non bf16.** I pesi bf16 passati come ``numpy`` ``uint16`` a una porta
+  ``ov.Type.bf16`` vengono reinterpretati come interi: 2048 NaN su GPU, errore
+  6e+19 su CPU. Con ``numpy`` ``float16`` nativo l'errore relativo e' 3,8e-04.
+* **Un solo request riutilizzato** per shape: crearlo costa 0,018 ms, quindi
+  era irrilevante, ma non costa nulla riutilizzarlo.
+* **Device di default = CPU.** Con i pesi passati a ogni chiamata il plugin GPU
+  gira a 1,05 GB/s contro i 5,25 GB/s del plugin CPU, e finisce 5x piu' lento.
+  Su 320 GEMM da 4 MFLOP il trasferimento dei pesi domina il compute, e
+  l'upload sul dispositivo e' piu' costoso di una memcpy locale. Su Lunar Lake
+  la memoria e' condivisa: la GPU non ha nulla da guadagnare qui.
+* I pesi si convertono una volta sola per expert e si riutilizzano dalla cache:
+  il backend non deve ricevere array float gia' dequantizzati.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 import openvino as ov
 import openvino.opset13 as ops
-from typing import Any
+
 from .key import ExpertKey
 from .store import ExpertStore
 
-class OpenVINOExpertBackend:
-    """OpenVINO-accelerated SwiGLU expert execution backend (Intel Arc GPU / NPU)."""
+# Ordine di preferenza misurato su Lunar Lake per il carico "pesi per call".
+# Ogni voce puo' essere sovrascritta con il parametro `device`.
+DEVICE_PREFERENCE = ("CPU", "GPU", "NPU")
 
-    def __init__(self, store: ExpertStore, device: str = "AUTO"):
+
+def pick_device(core: ov.Core, requested: str = "AUTO") -> str:
+    available = list(core.available_devices)
+    if requested != "AUTO" and requested in available:
+        return requested
+    for candidate in DEVICE_PREFERENCE:
+        if candidate in available:
+            return candidate
+    return available[0] if available else "CPU"
+
+
+class OpenVINOExpertBackend:
+    """OpenVINO-accelerated SwiGLU expert execution backend."""
+
+    def __init__(self, store: ExpertStore, device: str = "AUTO",
+                 weight_dtype: str = "f16", cache_capacity: int = 0) -> None:
         self.store = store
         self.core = ov.Core()
-        available = self.core.available_devices
+        self.target_device = pick_device(self.core, device)
+        self.weight_dtype = np.float16 if weight_dtype == "f16" else np.float32
+        self.cache_capacity = cache_capacity
 
-        if device == "GPU" and "GPU" in available:
-            self.target_device = "GPU"
-        elif "GPU" in available:
-            self.target_device = "GPU"
-        else:
-            self.target_device = "CPU"
+        self._compiled_models: dict[tuple[int, int], Any] = {}
+        self._requests: dict[tuple[int, int], Any] = {}
+        self._weight_cache: dict[ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._weight_order: list[ExpertKey] = []
 
-        self._compiled_models: dict[tuple[int, int], ov.CompiledModel] = {}
-        print(f"[OpenVINOBackend] Target Device selected: {self.target_device}")
+        print(f"[OpenVINOBackend] device={self.target_device} "
+              f"weights={weight_dtype} available={self.core.available_devices}")
 
-    def _get_compiled_model(self, hidden_size: int, intermediate_size: int) -> ov.CompiledModel:
-        shape_key = (hidden_size, intermediate_size)
-        if shape_key in self._compiled_models:
-            return self._compiled_models[shape_key]
+    # ------------------------------------------------------------------ graph
 
+    def _get_request(self, hidden_size: int, intermediate_size: int):
+        key = (hidden_size, intermediate_size)
+        request = self._requests.get(key)
+        if request is not None:
+            return request
+
+        wtype = ov.Type.f16 if self.weight_dtype is np.float16 else ov.Type.f32
         x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
-        gate = ops.parameter([intermediate_size, hidden_size], ov.Type.f32, name="gate")
-        up = ops.parameter([intermediate_size, hidden_size], ov.Type.f32, name="up")
-        down = ops.parameter([hidden_size, intermediate_size], ov.Type.f32, name="down")
+        gate = ops.parameter([hidden_size, intermediate_size], wtype, name="gate")
+        up = ops.parameter([hidden_size, intermediate_size], wtype, name="up")
+        down = ops.parameter([intermediate_size, hidden_size], wtype, name="down")
 
-        gate_proj = ops.matmul(x, gate, transpose_a=False, transpose_b=True)
-        up_proj = ops.matmul(x, up, transpose_a=False, transpose_b=True)
-        swish_gate = ops.swish(gate_proj)
-        swiglu_out = ops.multiply(swish_gate, up_proj)
-        out = ops.matmul(swiglu_out, down, transpose_a=False, transpose_b=True)
+        xc = ops.convert(x, wtype)
+        gate_proj = ops.matmul(xc, gate, transpose_a=False, transpose_b=False)
+        up_proj = ops.matmul(xc, up, transpose_a=False, transpose_b=False)
+        # SwiGLU: silu(gate) * up, scritto come gate * sigmoid(gate) * up.
+        act = ops.multiply(gate_proj, ops.sigmoid(gate_proj))
+        out = ops.matmul(ops.multiply(act, up_proj), down,
+                         transpose_a=False, transpose_b=False)
 
-        model = ov.Model([out], [x, gate, up, down], name="SwiGLU_Expert")
+        model = ov.Model([ops.convert(out, ov.Type.f32)], [x, gate, up, down],
+                         name="SwiGLU_Expert")
         compiled = self.core.compile_model(model, self.target_device)
-        self._compiled_models[shape_key] = compiled
-        return compiled
+        self._compiled_models[key] = compiled
+        request = compiled.create_infer_request()
+        self._requests[key] = request
+        return request
 
-    def forward(
-        self,
-        key: ExpertKey,
-        activation: list[float] | np.ndarray,
-        hidden_size: int,
-        intermediate_size: int,
-    ) -> list[float]:
-        gate_bytes = self.store.read_tensor(key, "gate")
-        up_bytes = self.store.read_tensor(key, "up")
-        down_bytes = self.store.read_tensor(key, "down")
+    # ------------------------------------------------------------------ weights
 
-        gate_arr = np.frombuffer(gate_bytes, dtype=np.float32).reshape(intermediate_size, hidden_size)
-        up_arr = np.frombuffer(up_bytes, dtype=np.float32).reshape(intermediate_size, hidden_size)
-        down_arr = np.frombuffer(down_bytes, dtype=np.float32).reshape(hidden_size, intermediate_size)
-        
+    def _weights(self, key: ExpertKey, hidden_size: int,
+                 intermediate_size: int):
+        cached = self._weight_cache.get(key)
+        if cached is not None:
+            self._weight_order.remove(key)
+            self._weight_order.append(key)
+            return cached
+
+        gate = self._decode(self.store.read_tensor(key, "gate"),
+                            (hidden_size, intermediate_size))
+        up = self._decode(self.store.read_tensor(key, "up"),
+                          (hidden_size, intermediate_size))
+        down = self._decode(self.store.read_tensor(key, "down"),
+                            (intermediate_size, hidden_size))
+
+        weights = (gate, up, down)
+        self._weight_cache[key] = weights
+        self._weight_order.append(key)
+        if self.cache_capacity and len(self._weight_order) > self.cache_capacity:
+            oldest = self._weight_order.pop(0)
+            self._weight_cache.pop(oldest, None)
+        return weights
+
+    def _decode(self, raw: bytes, shape: tuple[int, int]) -> np.ndarray:
+        array = np.frombuffer(raw, dtype=self.weight_dtype)
+        if array.size != shape[0] * shape[1]:
+            raise ValueError(
+                f"expert tensor has {array.size} {self.weight_dtype} elements, "
+                f"expected {shape[0] * shape[1]} for shape {shape}. "
+                "If this tensor is still quantized, dequantize it first: "
+                "a raw quantized buffer reinterpreted as float is not the same "
+                "thing, and if the values are small the result is all zeros."
+            )
+        return np.ascontiguousarray(array.reshape(shape))
+
+    def preload(self, key: ExpertKey, hidden_size: int, intermediate_size: int) -> None:
+        self._weights(key, hidden_size, intermediate_size)
+
+    def cache_size(self) -> int:
+        return len(self._weight_cache)
+
+    def clear_cache(self) -> None:
+        self._weight_cache.clear()
+        self._weight_order.clear()
+
+    # ------------------------------------------------------------------ forward
+
+    def forward(self, key: ExpertKey, activation: list[float] | np.ndarray,
+                hidden_size: int, intermediate_size: int) -> np.ndarray:
+        gate, up, down = self._weights(key, hidden_size, intermediate_size)
+        request = self._get_request(hidden_size, intermediate_size)
+
         if isinstance(activation, list):
-            x_arr = np.array(activation, dtype=np.float32).reshape(1, hidden_size)
+            x = np.ascontiguousarray(activation, dtype=np.float32).reshape(1, hidden_size)
         else:
-            x_arr = activation.reshape(1, hidden_size).astype(np.float32)
+            x = np.ascontiguousarray(activation, dtype=np.float32).reshape(1, hidden_size)
 
-        compiled = self._get_compiled_model(hidden_size, intermediate_size)
-        infer_request = compiled.create_infer_request()
-
-        results = infer_request.infer({
-            "activation": x_arr,
-            "gate": gate_arr,
-            "up": up_arr,
-            "down": down_arr,
+        result = request.infer({
+            "activation": x,
+            "gate": gate,
+            "up": up,
+            "down": down,
         })
-
-        output_tensor = list(results.values())[0]
-        return output_tensor.flatten().tolist()
+        return np.asarray(list(result.values())[0], dtype=np.float32).reshape(hidden_size)
