@@ -26,6 +26,7 @@ import openvino.opset13 as ops
 
 from .key import ExpertKey
 from .store import ExpertStore
+from .dequant import dequantize_to
 
 # Ordine di preferenza misurato su Lunar Lake per il carico "pesi per call".
 # Ogni voce puo' essere sovrascritta con il parametro `device`.
@@ -46,11 +47,15 @@ class OpenVINOExpertBackend:
     """OpenVINO-accelerated SwiGLU expert execution backend."""
 
     def __init__(self, store: ExpertStore, device: str = "AUTO",
-                 weight_dtype: str = "f16", cache_capacity: int = 0) -> None:
+                 weight_dtype: str = "f16", cache_capacity: int = 0,
+                 tensor_types: dict[int, dict[str, int]] | None = None,
+                 dequant_fn: Any = None) -> None:
         self.store = store
         self.core = ov.Core()
         self.target_device = pick_device(self.core, device)
         self.weight_dtype = np.float16 if weight_dtype == "f16" else np.float32
+        self.tensor_types = tensor_types or {}
+        self._dequant_fn = dequant_fn
         self.cache_capacity = cache_capacity
 
         self._compiled_models: dict[tuple[int, int], Any] = {}
@@ -101,11 +106,15 @@ class OpenVINOExpertBackend:
             self._weight_order.append(key)
             return cached
 
+        layer_types = self.tensor_types.get(key.layer, {})
         gate = self._decode(self.store.read_tensor(key, "gate"),
+                            layer_types.get("gate"),
                             (hidden_size, intermediate_size))
         up = self._decode(self.store.read_tensor(key, "up"),
+                          layer_types.get("up"),
                           (hidden_size, intermediate_size))
         down = self._decode(self.store.read_tensor(key, "down"),
+                            layer_types.get("down"),
                             (intermediate_size, hidden_size))
 
         weights = (gate, up, down)
@@ -116,15 +125,25 @@ class OpenVINOExpertBackend:
             self._weight_cache.pop(oldest, None)
         return weights
 
-    def _decode(self, raw: bytes, shape: tuple[int, int]) -> np.ndarray:
-        array = np.frombuffer(raw, dtype=self.weight_dtype)
-        if array.size != shape[0] * shape[1]:
+    def _decode(self, raw: bytes, ggml_type: int | None,
+                shape: tuple[int, int]) -> np.ndarray:
+        n_elements = shape[0] * shape[1]
+        if ggml_type is not None:
+            if self._dequant_fn is not None:
+                array = self._dequant_fn(raw, ggml_type, n_elements)
+            else:
+                dtype_str = "f16" if self.weight_dtype is np.float16 else "f32"
+                array = dequantize_to(raw, ggml_type, dtype_str)
+        else:
+            array = np.frombuffer(raw, dtype=self.weight_dtype)
+        if array.size != n_elements:
             raise ValueError(
                 f"expert tensor has {array.size} {self.weight_dtype} elements, "
-                f"expected {shape[0] * shape[1]} for shape {shape}. "
-                "If this tensor is still quantized, dequantize it first: "
-                "a raw quantized buffer reinterpreted as float is not the same "
-                "thing, and if the values are small the result is all zeros."
+                f"expected {n_elements} for shape {shape}. "
+                "If this tensor is still quantized, pass the ggml type so it "
+                "can be dequantized: a raw quantized buffer reinterpreted as "
+                "float produces garbage, and for small weights the result is "
+                "all zeros."
             )
         return np.ascontiguousarray(array.reshape(shape))
 

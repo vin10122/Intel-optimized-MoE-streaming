@@ -4,9 +4,6 @@ import sys
 import numpy as np
 from pathlib import Path
 import gguf
-from gguf import GGMLQuantizationType
-import openvino as ov
-import openvino.opset13 as ops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -17,12 +14,14 @@ from flash_moe import (
     ExpertTensorSlice,
     AsyncExpertStore,
     ExpertRouter,
+    OpenVINOExpertBackend,
+    MoEEngine,
 )
 from flash_moe.dequant import dequantize_to, name_of
 from flash_moe.paths import dll_path, model_path
 
 # Tipi ggml dei tensor gate/up/down, riempii in main() leggendo il GGUF.
-EXPERT_TYPES: dict[str, int] = {}
+EXPERT_TYPES: dict[int, dict[str, int]] = {}
 
 # Modello: nome in un solo posto (flash_moe.paths), override con FLASH_MOE_GGUF
 GGUF_FILE_PATH = model_path()
@@ -124,141 +123,26 @@ def build_manifest_from_gguf(gguf_path: Path) -> ExpertManifest:
     return ExpertManifest(gguf_path.parent, records)
 
 
-def expert_tensor_types(gguf_path: Path) -> dict[str, int]:
-    """Legge dal GGUF il tipo ggml di gate/up/down di un expert.
+def expert_tensor_types(gguf_path: Path) -> dict[int, dict[str, int]]:
+    """Legge dal GGUF il tipo ggml di gate/up/down per OGNI layer.
 
-    Non si fidare di una costante scritta a mano: il dequantizer e' scelto in
-    base a questo, e sbagliarlo non dà errore, dà pesi sbagliati.
+    Non si fidare di una costante globale: in questo modello i tipi variano
+    per layer (Q4_K layer 0, Q3_K layer 10-30, Q6_K layer 39 down). Usare il
+    tipo sbagliato non dà errore: il kernel C++ legge bytes_per_block sbagliati
+    e va fuori dal buffer. I tipi vanno letti per-layer dal GGUF.
     """
     reader = gguf.GGUFReader(gguf_path)
     tmap = {t.name: t for t in reader.tensors}
-    out: dict[str, int] = {}
-    for role in ("gate", "up", "down"):
-        name = f"blk.0.ffn_{role}_exps.weight"
-        if name not in tmap:
-            raise KeyError(f"tensor {name} assente dal GGUF: modello diverso?")
-        out[role] = int(tmap[name].tensor_type)
+    out: dict[int, dict[str, int]] = {}
+    for layer in range(40):
+        layer_types: dict[str, int] = {}
+        for role in ("gate", "up", "down"):
+            name = f"blk.{layer}.ffn_{role}_exps.weight"
+            if name in tmap:
+                layer_types[role] = int(tmap[name].tensor_type)
+        if layer_types:
+            out[layer] = layer_types
     return out
-
-
-class Q4K_F16_Backend:
-    """Backend OpenVINO GPU: pesi K-quant dequantizzati in float16."""
-
-    def __init__(self, store: AsyncExpertStore, device: str = "GPU", cache_capacity: int = 700):
-        self.store = store
-        self.core = ov.Core()
-        
-        available = self.core.available_devices
-        if device == "GPU" and "GPU" in available:
-            self.target_device = "GPU"
-        elif "GPU" in available:
-            self.target_device = "GPU"
-        else:
-            self.target_device = "CPU"
-        
-        self.cache_capacity = cache_capacity
-        self._compiled_models: dict[tuple[int, int], ov.CompiledModel] = {}
-        self._f16_cache: dict[ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        self.cache_order: list[ExpertKey] = []
-
-        print(f"[Q4K_F16_Backend] Target Device: {self.target_device}", flush=True)
-
-    def _get_compiled_model(self, hidden_size: int, intermediate_size: int) -> ov.CompiledModel:
-        shape_key = (hidden_size, intermediate_size)
-        if shape_key in self._compiled_models:
-            return self._compiled_models[shape_key]
-
-        # Attivazione in f32, pesi in f16. bf16 su questa piattaforma e' stato
-        # verificato non funzionante (tools/check_ov_precisions.py): il metodo
-        # che regge e' float16 nativo su porte a 16 bit.
-        x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
-        gate = ops.parameter([hidden_size, intermediate_size], ov.Type.f16, name="gate")
-        up = ops.parameter([hidden_size, intermediate_size], ov.Type.f16, name="up")
-        down = ops.parameter([intermediate_size, hidden_size], ov.Type.f16, name="down")
-
-        x_f16 = ops.convert(x, destination_type=ov.Type.f16)
-
-        gate_proj = ops.matmul(x_f16, gate, transpose_a=False, transpose_b=False)
-        up_proj = ops.matmul(x_f16, up, transpose_a=False, transpose_b=False)
-
-        # SwiGLU
-        swish_gate = ops.multiply(gate_proj, ops.sigmoid(gate_proj))
-        swiglu_out = ops.multiply(swish_gate, up_proj)
-
-        out = ops.matmul(swiglu_out, down, transpose_a=False, transpose_b=False)
-
-        out_f32 = ops.convert(out, destination_type=ov.Type.f32)
-
-        model = ov.Model([out_f32], [x, gate, up, down], name="SwiGLU_Expert_Q4K_F16")
-        compiled = self.core.compile_model(model, self.target_device)
-        self._compiled_models[shape_key] = compiled
-        return compiled
-
-    def _dequant_to_f16(self, raw_bytes: bytes, ggml_type: int,
-                        n_elements: int) -> np.ndarray:
-        return dequant_to_f16(raw_bytes, ggml_type, n_elements)
-
-    def _get_f16_weights(self, key: ExpertKey, intermediate_size: int,
-                         hidden_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Ottieni i pesi dell'expert in float16. Cache LRU."""
-        if key in self._f16_cache:
-            self.cache_order.remove(key)
-            self.cache_order.append(key)
-            return self._f16_cache[key]
-
-        print(f"[F16 Cache] MISS: carico esperto {key}", flush=True)
-
-        gate_bytes = self.store.read_tensor(key, "gate")
-        up_bytes = self.store.read_tensor(key, "up")
-        down_bytes = self.store.read_tensor(key, "down")
-
-        # gate e up sono Q4_K ma down e' Q8_0 nel GGUF: dequantizzarli con il
-        # tipo sbagliato produce pesi senza senso, non un errore evidente.
-        gate_f16 = dequant_to_f16(gate_bytes, EXPERT_TYPES["gate"],
-                                  hidden_size * intermediate_size)
-        up_f16 = dequant_to_f16(up_bytes, EXPERT_TYPES["up"],
-                                hidden_size * intermediate_size)
-        down_f16 = dequant_to_f16(down_bytes, EXPERT_TYPES["down"],
-                                  intermediate_size * hidden_size)
-
-        weights = (gate_f16, up_f16, down_f16)
-        self._f16_cache[key] = weights
-        self.cache_order.append(key)
-
-        if len(self._f16_cache) > self.cache_capacity:
-            oldest = self.cache_order.pop(0)
-            self._f16_cache.pop(oldest, None)
-            print(f"[F16 Cache] EVICT: rimosso {oldest}", flush=True)
-
-        return weights
-
-    def forward(
-        self,
-        key: ExpertKey,
-        activation: list[float] | np.ndarray,
-        hidden_size: int,
-        intermediate_size: int,
-    ) -> list[float]:
-        gate_f16, up_f16, down_f16 = self._get_f16_weights(key, intermediate_size, hidden_size)
-
-        if isinstance(activation, list):
-            x_arr = np.array(activation, dtype=np.float32).reshape(1, hidden_size)
-        else:
-            x_arr = activation.reshape(1, hidden_size).astype(np.float32)
-
-        compiled = self._get_compiled_model(hidden_size, intermediate_size)
-        infer_request = compiled.create_infer_request()
-
-        # float16 nativo: e' il metodo verificato in tools/check_ov_tensor_feeds.py
-        results = infer_request.infer({
-            "activation": x_arr,
-            "gate": gate_f16.reshape(hidden_size, intermediate_size),
-            "up": up_f16.reshape(hidden_size, intermediate_size),
-            "down": down_f16.reshape(intermediate_size, hidden_size),
-        })
-
-        output_tensor = list(results.values())[0]
-        return output_tensor.flatten().tolist()
 
 
 def main():
@@ -275,8 +159,10 @@ def main():
     # lo stesso tipo quantizzato, e la differenza non produce errori.
     global EXPERT_TYPES
     EXPERT_TYPES = expert_tensor_types(GGUF_FILE_PATH)
-    print(f"[GGUF] tipi expert: "
-          f"{ {k: name_of(v) for k, v in EXPERT_TYPES.items()} }", flush=True)
+    type_summary = {name_of(v) for role_dict in EXPERT_TYPES.values() for v in role_dict.values()}
+    print(f"[GGUF] tipi per layer: {len(EXPERT_TYPES)} layer, tipi usati: {sorted(type_summary)}",
+          flush=True)
+    print(f"[GGUF] layer 0: { {k: name_of(v) for k, v in EXPERT_TYPES[0].items()} }", flush=True)
 
     # 1. Manifest
     manifest = build_manifest_from_gguf(GGUF_FILE_PATH)
@@ -285,8 +171,13 @@ def main():
     CACHE_CAPACITY = 700
     store = AsyncExpertStore(GGUF_FILE_PATH.parent, capacity=CACHE_CAPACITY, manifest=manifest)
 
-    # 3. Backend K-quant -> float16
-    backend = Q4K_F16_Backend(store, device="GPU", cache_capacity=CACHE_CAPACITY)
+    # 3. Backend K-quant -> float16 (usa il pacchetto flash_moe)
+    backend = OpenVINOExpertBackend(
+        store, device="GPU", weight_dtype="f16",
+        cache_capacity=CACHE_CAPACITY,
+        tensor_types=EXPERT_TYPES,
+        dequant_fn=dequant_to_f16,
+    )
 
     # Configurazione
     hidden_dim = 2048
@@ -294,6 +185,7 @@ def main():
     num_experts = 256
     num_layers = 40
     router = ExpertRouter(hidden_size=hidden_dim, num_experts=num_experts, top_k=8)
+    engine = MoEEngine(store, backend, router, hidden_dim, inter_dim)
 
     # Benchmark
     num_tokens = 1
@@ -307,12 +199,7 @@ def main():
 
     for token_idx, activation in enumerate(tokens):
         for layer in range(num_layers):
-            expert_ids, weights = router.route(activation)
-            combined_output = np.zeros(hidden_dim, dtype=np.float32)
-            for expert_id, weight in zip(expert_ids, weights):
-                key = ExpertKey(layer, expert_id)
-                expert_out = backend.forward(key, activation, hidden_dim, inter_dim)
-                combined_output += weight * np.array(expert_out, dtype=np.float32)
+            engine.process_token(layer, activation)
         print(f" -> Token {token_idx + 1}/{num_tokens} processato!", flush=True)
 
     total_time = time.perf_counter() - start_time
@@ -339,7 +226,7 @@ def main():
     print(f" Cache Stats - Hits:              {store.stats.hits}", flush=True)
     print(f" Cache Stats - Misses:            {store.stats.misses}", flush=True)
     print(f" Dati letti da SSD:               {store.stats.bytes_read / (1024**2):.2f} MB", flush=True)
-    print(f" Esperti in cache:                {len(backend._f16_cache)}", flush=True)
+    print(f" Esperti in cache:                {backend.cache_size()}", flush=True)
     print("=" * 80, flush=True)
 
     store.close()
