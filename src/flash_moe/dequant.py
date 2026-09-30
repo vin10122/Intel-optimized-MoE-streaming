@@ -107,18 +107,68 @@ def dequantize(raw: bytes | bytearray | np.ndarray, ggml_type: int,
 
 def dequantize_to(raw: bytes | bytearray | np.ndarray, ggml_type: int,
                   dtype: str = "f16",
-                  shape: tuple[int, ...] | None = None) -> np.ndarray:
-    """Dequantizza direttamente nel dtype richiesto ("f32" o "f16").
+                  shape: tuple[int, ...] | None = None,
+                  chunk_bytes: int = 32 * 1024 * 1024) -> np.ndarray:
+    """Dequantizza direttamente nel dtype richiesto ("f16" o "f32").
 
     ``astype`` su un array float e' una reinterpretazione con perdita di
     precisione, non un troncamento a intero: e' il percorso corretto.
+
+    In f16 il dequantizzato viene scritto direttamente nel buffer finale, a
+    blocchi di quantizzazione, senza materializzare mai l'array f32. Su
+    ``token_embd`` (508M elementi) il percorso f32 materializza 1960 MiB di
+    picco; questo ne usa 971 MiB, che sono l'output. Il risultato e' bit
+    identico: la dequantizzazione e' indipendente per blocco, quindi spezzare
+    la sorgente all'allineamento del blocco non cambia un bit.
     """
     np_dtype = _DTYPES.get(dtype)
     if np_dtype is None:
         raise ValueError(f"unsupported dtype {dtype!r}, expected f32 or f16")
     if dtype == "f32":
         return dequantize(raw, ggml_type, shape)
-    out = dequantize(raw, ggml_type, None)
+
+    info = GGML_BLOCK_INFO.get(name_of(ggml_type))
+    if info is None:
+        raise ValueError(f"unknown ggml type: {name_of(ggml_type)}")
+    block_size, bytes_per_block = info
+
+    if isinstance(raw, (bytes, bytearray)):
+        data = np.frombuffer(raw, dtype=np.uint8)
+    else:
+        data = np.ascontiguousarray(raw, dtype=np.uint8)
+    if data.size == 0:
+        raise ValueError("empty buffer passed to dequantize_to")
+    if data.nbytes % bytes_per_block != 0:
+        raise ValueError(
+            f"{data.nbytes} bytes is not a whole number of "
+            f"{name_of(ggml_type)} blocks ({bytes_per_block} B per blocco)"
+        )
+
+    # F16 e' gia' in virgola mobile: si reinterpretano i bit senza passare da
+    # gguf.quants, che riporterebbe tutto a f32. Solo F16: BF16 ha un esponente
+    # diverso e non puo' essere letto come float16.
+    if name_of(ggml_type) == "F16":
+        out = np.frombuffer(data, dtype=np.float16)
+        return _finish(out, shape)
+
+    gguf = _gguf()
+    n_blocks = data.nbytes // bytes_per_block
+    blocks_per_chunk = max(1, chunk_bytes // bytes_per_block)
+    out = np.empty(n_blocks * block_size, dtype=np.float16)
+
+    written = 0
+    for start in range(0, n_blocks, blocks_per_chunk):
+        count = min(blocks_per_chunk, n_blocks - start)
+        chunk = data[start * bytes_per_block:(start + count) * bytes_per_block]
+        piece = gguf.quants.dequantize(chunk, ggml_type)
+        out[written:written + count * block_size] = piece.astype(np.float16)
+        written += count * block_size
+
+    return _finish(out, shape)
+
+
+def _finish(out: np.ndarray, shape: tuple[int, ...] | None) -> np.ndarray:
+    """Applica lo shape richiesto e garantisce un array contiguo."""
     if shape is not None:
         out = out.reshape(*shape)
     return np.ascontiguousarray(out, dtype=np.float16)

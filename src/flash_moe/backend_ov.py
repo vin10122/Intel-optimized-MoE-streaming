@@ -53,7 +53,14 @@ class OpenVINOExpertBackend:
         self.store = store
         self.core = ov.Core()
         self.target_device = pick_device(self.core, device)
-        self.weight_dtype = np.float16 if weight_dtype == "f16" else np.float32
+        # I pesi sono f16 e basta. Il ramo f32 non e' un'opzione: raddoppia
+        # la cache degli expert (6 -> 12 MiB per expert) e su questa
+        # piattaforma i pesi in float32 su porte a 16 bit non funzionano.
+        if weight_dtype != "f16":
+            raise ValueError(
+                f"weight_dtype={weight_dtype!r}: i pesi devono essere f16"
+            )
+        self.weight_dtype = np.float16
         self.tensor_types = tensor_types or {}
         self._dequant_fn = dequant_fn
         self.cache_capacity = cache_capacity
@@ -74,7 +81,7 @@ class OpenVINOExpertBackend:
         if request is not None:
             return request
 
-        wtype = ov.Type.f16 if self.weight_dtype is np.float16 else ov.Type.f32
+        wtype = ov.Type.f16
         x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
         gate = ops.parameter([hidden_size, intermediate_size], wtype, name="gate")
         up = ops.parameter([hidden_size, intermediate_size], wtype, name="up")
@@ -132,8 +139,7 @@ class OpenVINOExpertBackend:
             if self._dequant_fn is not None:
                 array = self._dequant_fn(raw, ggml_type, n_elements)
             else:
-                dtype_str = "f16" if self.weight_dtype is np.float16 else "f32"
-                array = dequantize_to(raw, ggml_type, dtype_str)
+                array = dequantize_to(raw, ggml_type, "f16")
         else:
             array = np.frombuffer(raw, dtype=self.weight_dtype)
         if array.size != n_elements:

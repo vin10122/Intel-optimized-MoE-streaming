@@ -10,8 +10,14 @@ from .dequant import (
     name_of,
     type_name_map,
 )
-from .backend_ov import OpenVINOExpertBackend
+from .norm import RMSNorm, rmsnorm_numpy
+from .rope import RoPE, DEFAULT_HEAD_DIM, DEFAULT_HEAD_COUNT, DEFAULT_KV_HEAD_COUNT, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
+from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
+from .embedding import EmbeddingLookup, LMHead, argmax_sample, sample
 from .router import ExpertRouter
+from .backend_ov import OpenVINOExpertBackend
+from .transformer import TransformerBlock
+from .model import Qwen3MoEModel
 from .engine import MoEEngine
 from .utils import pack_expert, pack_f32, unpack_f32, write_manifest
 
@@ -41,4 +47,22 @@ __all__ = [
     "pack_f32",
     "unpack_f32",
     "write_manifest",
+    "RMSNorm",
+    "rmsnorm_numpy",
+    "RoPE",
+    "DEFAULT_HEAD_DIM",
+    "DEFAULT_HEAD_COUNT",
+    "DEFAULT_KV_HEAD_COUNT",
+    "DEFAULT_ROPE_DIM",
+    "DEFAULT_FREQ_BASE",
+    "AttentionLayer",
+    "KVCache",
+    "scaled_dot_product_attention",
+    "softmax",
+    "EmbeddingLookup",
+    "LMHead",
+    "argmax_sample",
+    "sample",
+    "TransformerBlock",
+    "Qwen3MoEModel",
 ]

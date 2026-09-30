@@ -15,14 +15,19 @@ class RMSNorm:
     """Root Mean Square Layer Normalization (Qwen3)."""
 
     def __init__(self, weight: np.ndarray, eps: float = 1e-6) -> None:
-        self.weight = np.ascontiguousarray(weight, dtype=np.float32)
+        self.weight = np.ascontiguousarray(weight, dtype=np.float16)
         self.eps = eps
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """Normalizza x (shape [..., hidden]) con self.weight (shape [hidden])."""
+        """Normalizza x (shape [..., hidden]) con self.weight (shape [hidden]).
+
+        Il peso vive in f16, la riduzione in f32: la somma dei quadrati su
+        2048 termini in f16 perde i contributi piccoli, e ``x * x`` in f16
+        va in overflow sopra 256.
+        """
         x_f32 = np.ascontiguousarray(x, dtype=np.float32)
         rms = np.sqrt(np.mean(x_f32 * x_f32, axis=-1, keepdims=True) + self.eps)
-        return (x_f32 / rms) * self.weight
+        return ((x_f32 / rms) * self.weight.astype(np.float32)).astype(np.float16)
 
     @classmethod
     def from_bytes(cls, raw: bytes, eps: float = 1e-6) -> "RMSNorm":
@@ -35,4 +40,4 @@ def rmsnorm_numpy(x: np.ndarray, weight: np.ndarray, eps: float = 1e-6) -> np.nd
     """Reference NumPy per RMSNorm (usata nei test)."""
     x_f32 = x.astype(np.float32)
     rms = np.sqrt(np.mean(x_f32 * x_f32, axis=-1, keepdims=True) + eps)
-    return (x_f32 / rms) * weight
+    return (x_f32 / rms) * weight.astype(np.float32)
