@@ -61,10 +61,22 @@ else:
     print(f"[C++] {DLL_PATH.name} non presente, uso la reference gguf", flush=True)
 
 
-def dequant_to_f16(raw: bytes, ggml_type: int, n_elements: int) -> np.ndarray:
-    """Dequantizza in float16, C++ se disponibile altrimenti gguf.quants."""
+def dequant_to_f16(raw: bytes, ggml_type: int, n_elements: int,
+                   out: np.ndarray | None = None) -> np.ndarray:
+    """Dequantizza in float16, C++ se disponibile altrimenti gguf.quants.
+
+    ``out`` permette di dequantizzare in un buffer già allocato: chiedere
+    2 MiB nuovi al sistema operativo costa 0,56 ms su 0,96 ms per tensor, e
+    il kernel in sé fa 0,35 ms. Se il buffer non è della misura giusta o non
+    è scrivibile, si ignora e se ne alloca uno nuovo, così un caller che
+    sbaglia l'argomento non ottiene corruzione silenziosa.
+    """
+    if out is not None and (out.dtype != np.float16 or out.size != n_elements
+                            or not out.flags.writeable):
+        out = None
     if _cpp_dequant is not None:
-        out = np.empty(n_elements, dtype=np.float16)
+        if out is None:
+            out = np.empty(n_elements, dtype=np.float16)
         src = np.frombuffer(raw, dtype=np.uint8)
         rc = _cpp_dequant.dequant_k(
             ggml_type, src.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),

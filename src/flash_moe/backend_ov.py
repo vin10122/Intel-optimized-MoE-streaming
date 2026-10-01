@@ -69,6 +69,12 @@ class OpenVINOExpertBackend:
         self._requests: dict[tuple[int, int], Any] = {}
         self._weight_cache: dict[ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self._weight_order: list[ExpertKey] = []
+        # Buffer f16 riciclati, indicizzati per numero di elementi: un expert
+        # ha tensori di due grandezze diverse (hidden x inter e inter x hidden).
+        # Senza questo pool ogni dequant chiede pagine nuove al sistema operativo
+        # e i page fault costano 0,56 ms su 0,96 ms per tensor, cioe' il 59% del
+        # tempo di dequantizzazione. Vedi tools/test_weight_pool.py.
+        self._pool: dict[int, list[np.ndarray]] = {}
 
         print(f"[OpenVINOBackend] device={self.target_device} "
               f"weights={weight_dtype} available={self.core.available_devices}")
@@ -129,17 +135,51 @@ class OpenVINOExpertBackend:
         self._weight_order.append(key)
         if self.cache_capacity and len(self._weight_order) > self.cache_capacity:
             oldest = self._weight_order.pop(0)
-            self._weight_cache.pop(oldest, None)
+            self._release(self._weight_cache.pop(oldest, None))
         return weights
+
+    def _release(self, weights) -> None:
+        """Ricicla i buffer di un expert evictato.
+
+        Il backend non espone i propri array: ``_weights`` e' privato e
+        ``forward`` consuma i pesi in ``infer`` prima di restituire, quindi
+        un buffer evictato non e' piu' letto da nessuno. Tenerlo in una lista
+        di riuso evita che il prossimo expert debba faultare pagine nuove.
+
+        I pool sono limitati a ``cache_capacity`` elementi: la cache cresce
+        oltre perche' il prefetch riempie le prime voci, ma i buffer non
+        devono crescere con lei, altrimenti la RAM non tornerebbe piu' al
+        valore iniziale.
+        """
+        if weights is None:
+            return
+        for array in weights:
+            n = array.size
+            slot = self._pool.get(n)
+            if slot is None:
+                self._pool[n] = [array]
+            elif len(slot) < max(1, self.cache_capacity):
+                slot.append(array)
+
+    def _acquire(self, n_elements: int) -> np.ndarray:
+        slot = self._pool.get(n_elements)
+        if slot:
+            return slot.pop()
+        return np.empty(n_elements, dtype=self.weight_dtype)
+
+    def pool_size(self) -> int:
+        return sum(len(slot) for slot in self._pool.values())
 
     def _decode(self, raw: bytes, ggml_type: int | None,
                 shape: tuple[int, int]) -> np.ndarray:
         n_elements = shape[0] * shape[1]
-        if ggml_type is not None:
-            if self._dequant_fn is not None:
-                array = self._dequant_fn(raw, ggml_type, n_elements)
-            else:
-                array = dequantize_to(raw, ggml_type, "f16")
+        # Solo il percorso dequantizzato scrive nel buffer: nel ramo
+        # non-quantizzato l'array e' una vista su `raw` e non va riciclato.
+        if ggml_type is not None and self._dequant_fn is not None:
+            array = self._dequant_fn(raw, ggml_type, n_elements,
+                                      out=self._acquire(n_elements))
+        elif ggml_type is not None:
+            array = dequantize_to(raw, ggml_type, "f16")
         else:
             array = np.frombuffer(raw, dtype=self.weight_dtype)
         if array.size != n_elements:
@@ -162,6 +202,8 @@ class OpenVINOExpertBackend:
     def clear_cache(self) -> None:
         self._weight_cache.clear()
         self._weight_order.clear()
+        for slot in self._pool.values():
+            slot.clear()
 
     # ------------------------------------------------------------------ forward
 
