@@ -19,6 +19,7 @@ from flash_moe import (
 )
 from flash_moe.dequant import dequantize_to, name_of
 from flash_moe.paths import dll_path, model_path
+from flash_moe.shared_expert import SharedExpert
 
 # Tipi ggml dei tensor gate/up/down, riempii in main() leggendo il GGUF.
 EXPERT_TYPES: dict[int, dict[str, int]] = {}
@@ -197,14 +198,27 @@ def main():
     num_experts = 256
     num_layers = 40
 
+    # Shared expert: MLP denso che OGNI token attraversa, oltre agli 8 expert
+    # selezionati dal router. Il suo output viene sommato a quello degli
+    # expert, quindi ignorarlo cambia l'output di ogni token.
+    reader = gguf.GGUFReader(GGUF_FILE_PATH)
+    tensor_map = {t.name: t for t in reader.tensors}
+    shared = SharedExpert(
+        GGUF_FILE_PATH, num_layers=num_layers,
+        hidden_size=hidden_dim, intermediate_size=inter_dim,
+        dequant_fn=dequant_to_f16,
+    )
+    print(f"[Shared] expert denso caricato per {len(shared.layers)} layer",
+          flush=True)
+
     # Router: uno per layer, dai gate veri ffn_gate_inp.weight. Con un gate
     # finto il benchmark misverrebbe la cache su un pattern di accessi che il
     # modello non produce mai.
     expert_routers = routers_from_gguf(
-        {t.name: t for t in gguf.GGUFReader(GGUF_FILE_PATH).tensors},
-        num_layers, hidden_dim, num_experts, top_k=8,
+        tensor_map, num_layers, hidden_dim, num_experts, top_k=8,
     )
-    engine = MoEEngine(store, backend, expert_routers, hidden_dim, inter_dim)
+    engine = MoEEngine(store, backend, expert_routers, hidden_dim, inter_dim,
+                       shared_expert=shared)
 
     # Benchmark
     num_tokens = 1

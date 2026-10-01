@@ -14,6 +14,7 @@ class MoEEngine:
         routers: dict[int, ExpertRouter],
         hidden_size: int,
         intermediate_size: int,
+        shared_expert: Any = None,
     ):
         self.store = store
         self.backend = backend
@@ -24,6 +25,9 @@ class MoEEngine:
         self.routers = routers
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+        # Shared expert: se assente (None) il modello gira senza, ma su
+        # Qwen3/Qwen3.5-MoE la sua assenza cambia l'output di ogni token.
+        self.shared_expert = shared_expert
 
     def router_for(self, layer: int) -> ExpertRouter:
         try:
@@ -67,5 +71,13 @@ class MoEEngine:
             # the prefetch path and only pulls the tensor it needs.
             expert_out = self.backend.forward(key, activation, self.hidden_size, self.intermediate_size)
             combined_output += weight * np.asarray(expert_out, dtype=np.float32)
+
+        # 5. Contributo dello shared expert: NON e' uno degli 8 selezionati dal
+        # router, e ogni token lo attraversa. Va sommato dopo gli expert, non
+        # pesato: si somma al totale, gia' scalato dal suo gate sigmoid.
+        if self.shared_expert is not None:
+            shared_out = self.shared_expert.forward(layer, activation)
+            if shared_out is not None:
+                combined_output += shared_out
 
         return combined_output.tolist()
