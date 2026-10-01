@@ -41,7 +41,9 @@
 
 /* Conversione f16 <-> f32 in software, senza dipendere dagli intrinsic F16C:
    il toolset 2022 BuildTools non dichiara _cvtsh_ss/_cvtss_sh senza
-   l'header apposito, e una conversione software e' comunque vettorizzabile. */
+   l'header apposito, e una conversione software e' comunque vettorizzabile.
+   Resta il fallback per CPU senza F16C: il path misurato su Qwen3-MoE e' 35x
+   piu' lento della conversione vettorizzata, quindi conta solo come sicurezza. */
 
 static inline float f16_to_f32(uint16_t h) {
     const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -106,6 +108,36 @@ static inline uint16_t f32_to_f16(float f) {
     }
     return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
 }
+
+#ifdef __AVX2__
+#include <intrin.h>
+
+static bool have_f16c() {
+    int regs[4] = {0, 0, 0, 0};
+    __cpuid(regs, 1);
+    return (regs[2] & (1 << 29)) != 0;   /* ECX bit 29 = F16C */
+}
+
+/* 8 f32 -> 8 f16 per istruzione. Stessa semantica di arrotondamento della
+   versione software: round to nearest even, subnormali inclusi. */
+static void cvt_f32_to_f16(const float* src, uint16_t* dst, int64_t n) {
+    int64_t i = 0;
+    if (have_f16c()) {
+        for (; i + 8 <= n; i += 8) {
+            const __m256 v = _mm256_loadu_ps(src + i);
+            /* 0 = round to nearest even, senza eccezioni: stessa aritmetica
+               della versione software. */
+            const __m128i h = _mm256_cvtps_ph(v, 0);
+            _mm_storeu_si128((__m128i*)(dst + i), h);
+        }
+    }
+    for (; i < n; ++i) dst[i] = f32_to_f16(src[i]);
+}
+#else
+static void cvt_f32_to_f16(const float* src, uint16_t* dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) dst[i] = f32_to_f16(src[i]);
+}
+#endif
 
 /* ------------------------------------------------------------------ Q8_0 --- */
 /* 34 B:  f16 d,  int8 qs[32].   y[i] = qs[i] * d */
@@ -316,18 +348,32 @@ extern "C" __declspec(dllexport) int dequant_k(int type, const uint8_t* src,
         return 0;
     }
 
-    float* tmp = (float*)std::malloc((size_t)n * sizeof(float));
+    /* f16: si dequantizza a chunk in un buffer piccolo che resta in L1 e si
+       converte subito, invece di materializzare l'intero tensore in f32.
+       Con 3 MiB di picco su 1M elementi il buffer f32 finiva fuori cache e il
+       ciclo di scrittura+conversione dominate il tempo: era il 94% del costo
+       dell'expert. Lo stesso risultato in bit: la conversione e' indipendente
+       per blocco. */
+    const int64_t CHUNK = 8192;                 /* elementi per passata */
+    float* tmp = (float*)std::malloc((size_t)CHUNK * sizeof(float));
     if (tmp == nullptr) return -1;
-    switch (type) {
-        case GGML_TYPE_Q8_0: dequant_q8_0(src, tmp, nblocks); break;
-        case GGML_TYPE_Q3_K: dequant_q3_k(src, tmp, nblocks); break;
-        case GGML_TYPE_Q4_K: dequant_q4_k(src, tmp, nblocks); break;
-        case GGML_TYPE_Q5_K: dequant_q5_k(src, tmp, nblocks); break;
-        case GGML_TYPE_Q6_K: dequant_q6_k(src, tmp, nblocks); break;
-    }
+
     uint16_t* o16 = (uint16_t*)dst;
-    for (int64_t i = 0; i < n; ++i) o16[i] = f32_to_f16(tmp[i]);
+    int64_t done = 0;
+    while (done < n) {
+        const int64_t n_now = (n - done < CHUNK) ? (n - done) : CHUNK;
+        const int64_t b_now = n_now / bs;       /* n e' multiplo di bs */
+        switch (type) {
+            case GGML_TYPE_Q8_0: dequant_q8_0(src + done / bs * pb, tmp, b_now); break;
+            case GGML_TYPE_Q3_K: dequant_q3_k(src + done / bs * pb, tmp, b_now); break;
+            case GGML_TYPE_Q4_K: dequant_q4_k(src + done / bs * pb, tmp, b_now); break;
+            case GGML_TYPE_Q5_K: dequant_q5_k(src + done / bs * pb, tmp, b_now); break;
+            case GGML_TYPE_Q6_K: dequant_q6_k(src + done / bs * pb, tmp, b_now); break;
+            default: std::free(tmp); return -1;
+        }
+        cvt_f32_to_f16(tmp, o16 + done, n_now);
+        done += n_now;
+    }
     std::free(tmp);
-    (void)pb;
     return 0;
 }

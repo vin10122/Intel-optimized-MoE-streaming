@@ -35,6 +35,8 @@ call "%VCVARS%" >nul
 
 echo [BUILD] compilando cpp\dequant_k.cpp (AVX2 + F16C)
 pushd "%ROOT%"
+:: /arch:AVX2 non basta da solo per gli intrinsic F16C (_mm256_cvtps_ph):
+:: il path f16 e' quello che genera i pesi per OpenVINO, ed e' il piu' caldo.
 cl /nologo /EHsc /O2 /arch:AVX2 /LD /W3 ^
    cpp\dequant_k.cpp ^
    /link /OUT:"%OUT_DLL%" /DLL /MACHINE:x64
