@@ -11,15 +11,28 @@ class MoEEngine:
         self,
         store: AsyncExpertStore,
         backend: Any,
-        router: ExpertRouter,
+        routers: dict[int, ExpertRouter],
         hidden_size: int,
         intermediate_size: int,
     ):
         self.store = store
         self.backend = backend
-        self.router = router
+        # Un router per layer: i gate ffn_gate_inp.weight cambiano in ogni
+        # strato. Un solo router condiviso selezionerebbe lo stesso set di
+        # expert in tutti i 40 layer e il routing non sarebbe quello del
+        # modello.
+        self.routers = routers
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+
+    def router_for(self, layer: int) -> ExpertRouter:
+        try:
+            return self.routers[layer]
+        except KeyError as error:
+            raise KeyError(
+                f"nessun router per il layer {layer}: ffn_gate_inp.weight "
+                f"mancante, gli expert da eseguire non sono determinabili"
+            ) from error
 
     def process_token(
         self,
@@ -32,7 +45,7 @@ class MoEEngine:
             self.store.prefetch(next_expert_key)
 
         # 2. Select top-k experts and compute routing weights
-        expert_ids, weights = self.router.route(activation)
+        expert_ids, weights = self.router_for(layer).route(activation)
 
         # 3. Execute active experts and compute weighted output sum
         combined_output = np.zeros(self.hidden_size, dtype=np.float32)

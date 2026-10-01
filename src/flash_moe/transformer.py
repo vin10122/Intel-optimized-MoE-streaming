@@ -180,8 +180,13 @@ class TransformerBlock:
 
         return out
 
-    def _moe_forward(self, x: np.ndarray, activation_list: list[List[float]]) -> np.ndarray:
-        """Runs MoE MLP forward using the backend + router."""
+    def _moe_forward(self, x: np.ndarray) -> np.ndarray:
+        """Runs MoE MLP forward using the backend + this layer's router.
+
+        Il router e' quello del layer: i gate ffn_gate_inp.weight cambiano in
+        ogni strato, quindi un router condiviso selezionerebbe lo stesso set
+        di expert 40 volte.
+        """
         if self.backend is None or self.router is None:
             return x  # identity if no MoE
 
@@ -223,11 +228,8 @@ class TransformerBlock:
         # 2. MoE feed-forward
         normed2 = self.post_attn_norm.forward(h)
 
-        # The MoE processes a single activation (simplified: only last token)
-        if normed2.shape[1] == 1:
-            moe_out = self._moe_forward(normed2, [normed2[0, 0, :].tolist()])
-        else:
-            # For training/prefill: process each position
-            moe_out = self._moe_forward(normed2, [])
+        # _moe_forward itera gia' su tutte le posizioni della sequenza, quindi
+        # prefill e decode passano dallo stesso ramo.
+        moe_out = self._moe_forward(normed2)
 
         return h + moe_out

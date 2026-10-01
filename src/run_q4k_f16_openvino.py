@@ -13,7 +13,7 @@ from flash_moe import (
     ExpertRecord,
     ExpertTensorSlice,
     AsyncExpertStore,
-    ExpertRouter,
+    routers_from_gguf,
     OpenVINOExpertBackend,
     MoEEngine,
 )
@@ -184,8 +184,15 @@ def main():
     inter_dim = 512
     num_experts = 256
     num_layers = 40
-    router = ExpertRouter(hidden_size=hidden_dim, num_experts=num_experts, top_k=8)
-    engine = MoEEngine(store, backend, router, hidden_dim, inter_dim)
+
+    # Router: uno per layer, dai gate veri ffn_gate_inp.weight. Con un gate
+    # finto il benchmark misverrebbe la cache su un pattern di accessi che il
+    # modello non produce mai.
+    expert_routers = routers_from_gguf(
+        {t.name: t for t in gguf.GGUFReader(GGUF_FILE_PATH).tensors},
+        num_layers, hidden_dim, num_experts, top_k=8,
+    )
+    engine = MoEEngine(store, backend, expert_routers, hidden_dim, inter_dim)
 
     # Benchmark
     num_tokens = 1

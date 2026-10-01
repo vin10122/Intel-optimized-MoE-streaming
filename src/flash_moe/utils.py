@@ -10,6 +10,16 @@ def unpack_f32(payload: bytes) -> list[float]:
 def pack_f32(values: list[float]) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
+def unpack_f16(payload: bytes) -> list[float]:
+    if len(payload) % 2 != 0:
+        raise ValueError("f16 payload size must be divisible by 2")
+    return list(struct.unpack(f"<{len(payload) // 2}e", payload))
+
+def pack_f16(values: list[float]) -> bytes:
+    """Impacchetta in float16. E' il formato con cui il backend legge gli
+    expert non quantizzati: i pesi in RAM sono f16."""
+    return struct.pack(f"<{len(values)}e", *values)
+
 def pack_expert(
     root: str | Path,
     key: ExpertKey,

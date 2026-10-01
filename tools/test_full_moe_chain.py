@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from flash_moe import (  # noqa: E402
     ExpertKey,
     AsyncExpertStore,
-    ExpertRouter,
+    synthetic_router,
     OpenVINOExpertBackend,
     MoEEngine,
 )
@@ -113,11 +113,15 @@ def main() -> int:
         tensor_types=layer_types_map,
         dequant_fn=dequant_to_f16,
     )
-    router = ExpertRouter(HIDDEN, n_experts, top_k=8, seed=42)
-    engine = MoEEngine(store, backend, router, HIDDEN, INTER)
-
-    # Activation simulata (così' come l'avrebbe un layer di attention)
     rng = np.random.default_rng(42)
+    # Router finto ma deterministico, uno per layer. Il reference qui sotto
+    # usa lo stesso router, quindi il confronto OpenVINO/NumPy resta valido:
+    # quello che si misura e' l'esecuzione degli expert, non la scelta.
+    routers = {
+        layer: synthetic_router(HIDDEN, n_experts, top_k=8, seed=42, layer=layer)
+        for layer in range(N_LAYERS)
+    }
+    engine = MoEEngine(store, backend, routers, HIDDEN, INTER)
     activation = rng.standard_normal(HIDDEN).astype(np.float32) * 0.1
 
     print(f"\nValidazione per-layer (8 expert/layer, top_k=8)...")
@@ -136,7 +140,7 @@ def main() -> int:
         )
 
         # Reference: NumPy (Python dequant + NumPy SwiGLU)
-        eids, weights = router.route(activation)
+        eids, weights = routers[layer].route(activation)
         ref_out = numpy_moe_layer(
             activation, layer, eids, weights, tmap, n_experts, gguf_path
         ).astype(np.float64)
@@ -165,8 +169,11 @@ def main() -> int:
         tensor_types=layer_types_map,
         dequant_fn=dequant_to_f16,
     )
-    router = ExpertRouter(HIDDEN, n_experts, top_k=8, seed=42)
-    engine = MoEEngine(store, backend, router, HIDDEN, INTER)
+    routers = {
+        layer: synthetic_router(HIDDEN, n_experts, top_k=8, seed=42, layer=layer)
+        for layer in range(N_LAYERS)
+    }
+    engine = MoEEngine(store, backend, routers, HIDDEN, INTER)
     activation = rng.standard_normal(HIDDEN).astype(np.float32) * 0.1
 
     t0 = time.perf_counter()

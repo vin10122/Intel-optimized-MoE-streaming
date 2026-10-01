@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from flash_moe import (  # noqa: E402
     ExpertKey,
     AsyncExpertStore,
-    ExpertRouter,
+    synthetic_router,
     OpenVINOExpertBackend,
     MoEEngine,
 )
@@ -146,8 +146,8 @@ def main() -> int:
     # ---------------------------------------------------------------- D
     print("\n D. MoEEngine.process_token(next_expert_key=...) triggera prefetch")
     store_d, backend_d = make_store_backend(gguf_path, layer_types_map, manifest)
-    router_d = ExpertRouter(HIDDEN, 256, top_k=8, seed=42)
-    engine_d = MoEEngine(store_d, backend_d, router_d, HIDDEN, INTER)
+    router_d = synthetic_router(HIDDEN, 256, top_k=8, seed=42, layer=0)
+    engine_d = MoEEngine(store_d, backend_d, {0: router_d}, HIDDEN, INTER)
     next_key = ExpertKey(0, 70)
     engine_d.process_token(0, x, next_expert_key=next_key)
     check("pending_loads non vuoto dopo process_token con hint",

@@ -14,12 +14,12 @@ from .norm import RMSNorm, rmsnorm_numpy
 from .rope import RoPE, DEFAULT_HEAD_DIM, DEFAULT_HEAD_COUNT, DEFAULT_KV_HEAD_COUNT, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .embedding import EmbeddingLookup, LMHead, argmax_sample, sample
-from .router import ExpertRouter
+from .router import ExpertRouter, routers_from_gguf, synthetic_router
 from .backend_ov import OpenVINOExpertBackend
 from .transformer import TransformerBlock
 from .model import Qwen3MoEModel
 from .engine import MoEEngine
-from .utils import pack_expert, pack_f32, unpack_f32, write_manifest
+from .utils import pack_expert, pack_f32, unpack_f32, pack_f16, unpack_f16, write_manifest
 
 __all__ = [
     "ExpertKey",
@@ -42,10 +42,14 @@ __all__ = [
     "type_name_map",
     "OpenVINOExpertBackend",
     "ExpertRouter",
+    "routers_from_gguf",
+    "synthetic_router",
     "MoEEngine",
     "pack_expert",
     "pack_f32",
     "unpack_f32",
+    "pack_f16",
+    "unpack_f16",
     "write_manifest",
     "RMSNorm",
     "rmsnorm_numpy",

@@ -1,22 +1,210 @@
+"""Router MoE: top-k expert e pesi, con i gate veri del GGUF.
+
+Il gate e' ``blk.N.ffn_gate_inp.weight``, ne=(2048, 256) F32, **uno per
+layer**: 40 matrici diverse. Un router unico condiviso fra i layer
+selezionerebbe lo stesso set di expert in ogni strato, che non e' quello
+che fa il modello.
+
+Sul softmax
+-----------
+llama.cpp calcola ``softmax`` su tutti i 256 expert, prende i top-k e
+rinormalizza. Qui si prende prima il top-k e poi si applica il softmax
+solo su quelli. E' la stessa cosa, e non e' un'approssimazione: il
+denominatore della rinormalizzazione finale coinvolge solo gli expert
+seletti, quindi ``exp(z_i) / sum_{j in T} exp(z_j)`` e' lo stesso
+numero in entrambi gli ordini. Il vantaggio e' che non si calcola
+softmax su 256 numeri per averne 8.
+
+Sul f16
+-------
+I gate sono 2048x256 per layer, 40 layer: 42M parametri, 84 MiB in f16
+contro 168 MiB in f32. Il prodotto however si fa in f32 e il confronto
+degli score anche: in f16 due expert su 256 possono risultare pari e
+``argsort`` ne sceglie uno a caso, il che riproduce esattamente il difetto
+che rende il routing non deterministico fra due run.
+"""
+
+from __future__ import annotations
+
 import numpy as np
 
-class ExpertRouter:
-    """Qwen MoE Gating network that selects top-k experts and computes normalized Softmax weights."""
 
-    def __init__(self, hidden_size: int, num_experts: int, top_k: int = 2, seed: int = 42):
+class ExpertRouter:
+    """Top-k expert selection sui gate di un singolo layer.
+
+    Un istanza per layer. ``route`` e' puro e deterministico: stessa
+    attivazione, stesso output, senza stato interno.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int = 2,
+        gate_weights: np.ndarray | None = None,
+        gate_dtype: np.dtype | type = np.float16,
+    ) -> None:
+        if top_k < 1:
+            raise ValueError(f"top_k must be at least 1, got {top_k}")
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be at least 1, got {num_experts}")
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
-        np.random.seed(seed)
-        self.gate_weights = np.random.randn(hidden_size, num_experts).astype(np.float16)
+        self.gate_dtype = np.dtype(gate_dtype)
+        self.gate_weights = self._normalize_gate(
+            gate_weights, hidden_size, num_experts, self.gate_dtype
+        )
+
+    @staticmethod
+    def _normalize_gate(
+        gate_weights: np.ndarray | None,
+        hidden_size: int,
+        num_experts: int,
+        gate_dtype: np.dtype,
+    ) -> np.ndarray:
+        if gate_weights is None:
+            raise ValueError(
+                "ExpertRouter requires the layer's real ffn_gate_inp weights. "
+                "A random gate does not reproduce the model's routing: it "
+                "selects experts the model would never have chosen, and it "
+                "makes the prefetch target meaningless."
+            )
+        w = np.asarray(gate_weights, dtype=gate_dtype)
+        if w.shape != (hidden_size, num_experts):
+            # Il GGUF tiene il gate come (n_expert, n_embd): l'asse degli
+            # esperti e' quello veloce, quindi va trasposto per usarlo come
+            # hidden x expert.
+            if w.shape == (num_experts, hidden_size):
+                w = w.T
+            else:
+                raise ValueError(
+                    f"gate weight shape {w.shape} is neither "
+                    f"({hidden_size}, {num_experts}) nor "
+                    f"({num_experts}, {hidden_size})"
+                )
+        if not np.isfinite(np.asarray(w, dtype=np.float32)).all():
+            raise ValueError("gate weights contain NaN or Inf")
+        return np.ascontiguousarray(w, dtype=gate_dtype)
+
+    @classmethod
+    def from_gguf_tensor(
+        cls,
+        tensor,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        gate_dtype: np.dtype | type = np.float16,
+    ) -> "ExpertRouter":
+        """Costruisce il router di un layer da ``ffn_gate_inp.weight``.
+
+        Il tensor e' F32 nel GGUF; la precisione di storage e' un parametro
+        perche' cambia il routing: in f16 una coppia di expert con punteggio
+        vicino si ribalta, e con 2048 termini per il prodotto l'errore
+        relativo del gate si accumula. Vedere tools/test_router.py, che
+        misura la frequenza con cui accade.
+        """
+        shape = tuple(int(s) for s in reversed(tensor.shape))
+        if shape not in ((num_experts, hidden_size), (hidden_size, num_experts)):
+            raise ValueError(
+                f"ffn_gate_inp shape {shape} does not match "
+                f"{num_experts} experts x {hidden_size} hidden"
+            )
+        return cls(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            gate_weights=np.asarray(tensor.data, dtype=gate_dtype),
+            gate_dtype=gate_dtype,
+        )
+
+    def scores(self, activation: list[float] | np.ndarray) -> np.ndarray:
+        """Punteggio di tutti gli expert, in f32. Non seleziona."""
+        x = np.asarray(activation, dtype=np.float32).reshape(-1)
+        if x.size != self.hidden_size:
+            raise ValueError(
+                f"activation has {x.size} elements, expected {self.hidden_size}"
+            )
+        # x @ gate in f32; la promozione avviene sull'array del gate solo se
+        # non e' gia' f32.
+        return (x @ np.asarray(self.gate_weights, dtype=np.float32)).astype(np.float32)
 
     def route(self, activation: list[float] | np.ndarray) -> tuple[list[int], list[float]]:
-        # Gate e pesi in f16, indici e softmax in f32: il confronto dei punteggi
-        # in f16 puo'pare due expert su 256 e sceglierne uno a caso.
-        scores = np.dot(np.asarray(activation, dtype=np.float16), self.gate_weights).astype(np.float32)
-        top_k_indices = np.argsort(scores)[-self.top_k:][::-1].tolist()
-        top_k_scores = scores[top_k_indices]
+        """Restituisce (indici dei top-k, pesi normalizzati che sommano a 1)."""
+        scores = self.scores(activation)
+
+        # argsort stabile sui soli top-k: il confronto e' in f32.
+        top_k_indices = np.argsort(scores)[-self.top_k:][::-1].astype(np.int64).tolist()
+        top_k_scores = scores[top_k_indices].astype(np.float64)
 
         exp_scores = np.exp(top_k_scores - np.max(top_k_scores))
-        weights = (exp_scores / np.sum(exp_scores)).tolist()
-        return top_k_indices, weights
+        total = exp_scores.sum()
+        if not np.isfinite(total) or total <= 0.0:
+            # Tutti i top-k a -inf: il softmax non ha un modo naturale di
+            # ripartire. Si ripartisce uniformemente invece di restituire
+            # NaN, che poi finirebbe negli hidden senza che nessuno se ne
+            # accorga.
+            weights = np.full(len(top_k_indices), 1.0 / len(top_k_indices))
+        else:
+            weights = exp_scores / total
+
+        return top_k_indices, [float(w) for w in weights]
+
+
+def softmax_all_experts(scores: np.ndarray) -> np.ndarray:
+    """Reference: softmax su tutti gli expert, per il test di equivalenza."""
+    s = np.asarray(scores, dtype=np.float64)
+    e = np.exp(s - s.max())
+    return e / e.sum()
+
+
+def routers_from_gguf(
+    tmap: dict,
+    num_layers: int,
+    hidden_size: int,
+    num_experts: int,
+    top_k: int,
+    arch: str = "qwen35moe",
+    gate_dtype: np.dtype | type = np.float16,
+) -> dict[int, ExpertRouter]:
+    """Costruisce il router di ogni layer da ``blk.N.ffn_gate_inp.weight``.
+
+    Punto unico di lettura dei gate: lo usano sia il modello completo sia i
+    runner, cosi' il prefetch e la selezione degli expert non possono
+    divergere perche' leggono i pesi in modo diverso.
+    """
+    routers: dict[int, ExpertRouter] = {}
+    missing: list[int] = []
+    for layer in range(num_layers):
+        gate_t = tmap.get(f"blk.{layer}.ffn_gate_inp.weight")
+        if gate_t is None:
+            missing.append(layer)
+            continue
+        routers[layer] = ExpertRouter.from_gguf_tensor(
+            gate_t, hidden_size, num_experts, top_k, gate_dtype=gate_dtype
+        )
+    if missing:
+        raise KeyError(
+            f"manca ffn_gate_inp.weight per i layer {missing}: senza il gate "
+            "non si puo' scegliere quali expert eseguire"
+        )
+    return routers
+
+
+def synthetic_router(
+    hidden_size: int,
+    num_experts: int,
+    top_k: int,
+    seed: int = 0,
+    layer: int | None = None,
+) -> ExpertRouter:
+    """Router con gate finto, deterministico. Solo per test e benchmark.
+
+    Non riproduce il routing del modello: serve a esercitare store, cache e
+    prefetch senza dipendere dal GGUF. Ogni layer riceve un seed diverso,
+    altrimenti tutti i layer selezionerebbero gli stessi expert e il test
+    non coprirebbe nulla sul routing per-layer.
+    """
+    rng = np.random.default_rng(seed if layer is None else seed + 1000 * layer)
+    gate = rng.standard_normal((hidden_size, num_experts)).astype(np.float16)
+    return ExpertRouter(hidden_size, num_experts, top_k=top_k, gate_weights=gate)

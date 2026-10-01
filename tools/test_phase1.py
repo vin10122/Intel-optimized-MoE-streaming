@@ -26,7 +26,7 @@ from flash_moe import (  # noqa: E402
     AsyncExpertStore,
     ExpertKey,
     ExpertManifest,
-    ExpertRouter,
+    synthetic_router,
     MoEEngine,
     OpenVINOExpertBackend,
     dequantize,
@@ -35,6 +35,7 @@ from flash_moe import (  # noqa: E402
     name_of,
     pack_expert,
     pack_f32,
+    pack_f16,
     write_manifest,
 )
 
@@ -59,9 +60,9 @@ def build_mock_model(root: Path, layers: int = 2, experts: int = 4,
         for eid in range(experts):
             key = ExpertKey(layer, eid)
             tensors = {
-                "gate": pack_f32((rng.standard_normal(hidden * inter) * 0.05).tolist()),
-                "up": pack_f32((rng.standard_normal(hidden * inter) * 0.05).tolist()),
-                "down": pack_f32((rng.standard_normal(inter * hidden) * 0.05).tolist()),
+                "gate": pack_f16((rng.standard_normal(hidden * inter) * 0.05).tolist()),
+                "up": pack_f16((rng.standard_normal(hidden * inter) * 0.05).tolist()),
+                "down": pack_f16((rng.standard_normal(inter * hidden) * 0.05).tolist()),
             }
             records.append(pack_expert(root, key, tensors))
     return ExpertManifest.load(write_manifest(root, records))
@@ -273,16 +274,17 @@ def test_backend() -> None:
         root = Path(tmp)
         manifest = build_mock_model(root, layers=1, experts=2, hidden=hidden, inter=inter)
         store = AsyncExpertStore(root, capacity=4, manifest=manifest)
-        backend = OpenVINOExpertBackend(store, device="AUTO", weight_dtype="f32")
+        backend = OpenVINOExpertBackend(store, device="AUTO", weight_dtype="f16")
 
         rng = np.random.default_rng(11)
         x = rng.standard_normal(hidden).astype(np.float32)
         key = ExpertKey(0, 0)
         out = backend.forward(key, x, hidden, inter)
 
-        gate = np.frombuffer(store.read_tensor(key, "gate"), np.float32).reshape(hidden, inter)
-        up = np.frombuffer(store.read_tensor(key, "up"), np.float32).reshape(hidden, inter)
-        down = np.frombuffer(store.read_tensor(key, "down"), np.float32).reshape(inter, hidden)
+        # I pesi della mock sono f16, come quelli che il backend si aspetta.
+        gate = np.frombuffer(store.read_tensor(key, "gate"), np.float16).astype(np.float32).reshape(hidden, inter)
+        up = np.frombuffer(store.read_tensor(key, "up"), np.float16).astype(np.float32).reshape(hidden, inter)
+        down = np.frombuffer(store.read_tensor(key, "down"), np.float16).astype(np.float32).reshape(inter, hidden)
         gp = x @ gate
         ref = (gp * (1.0 / (1.0 + np.exp(-gp)))) * (x @ up) @ down
 
@@ -294,13 +296,13 @@ def test_backend() -> None:
               len(backend._requests) == 1, f"requests={len(backend._requests)}")
 
         # device misurati. La tolleranza cross-device e' piu' larga della CPU:
-        # GPU e NPU cambiano l'ordine di accumulo del matmul, e su f32 con
-        # inner dimension 64 un errore di few 1e-4 e' atteso, non un bug.
+        # GPU e NPU cambiano l'ordine di accumulo del matmul, e su f16 con
+        # inner dimension 64 un errore di few 1e-3 e' atteso, non un bug.
         for dev in backend.core.available_devices:
-            alt = OpenVINOExpertBackend(store, device=dev, weight_dtype="f32")
+            alt = OpenVINOExpertBackend(store, device=dev, weight_dtype="f16")
             o2 = alt.forward(key, x, hidden, inter)
             e2 = float(np.abs(o2 - ref).max() / np.abs(ref).max())
-            tol = 1e-4 if dev == "CPU" else 5e-3
+            tol = 1e-3 if dev == "CPU" else 5e-3
             check(f"backend: corretto anche su {dev}", e2 < tol,
                   f"errore relativo {e2:.3e}, tolleranza {tol:g}")
 
@@ -318,9 +320,12 @@ def test_engine() -> None:
         root = Path(tmp)
         manifest = build_mock_model(root, layers=2, experts=4, hidden=hidden, inter=inter)
         store = AsyncExpertStore(root, capacity=2, manifest=manifest)
-        backend = OpenVINOExpertBackend(store, device="AUTO", weight_dtype="f32")
-        router = ExpertRouter(hidden_size=hidden, num_experts=4, top_k=2)
-        engine = MoEEngine(store, backend, router, hidden, inter)
+        backend = OpenVINOExpertBackend(store, device="AUTO", weight_dtype="f16")
+        routers = {
+            layer: synthetic_router(hidden, 4, top_k=2, seed=3, layer=layer)
+            for layer in range(2)
+        }
+        engine = MoEEngine(store, backend, routers, hidden, inter)
 
         rng = np.random.default_rng(5)
         ok = True

@@ -12,7 +12,7 @@ from .norm import RMSNorm
 from .rope import RoPE, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .backend_ov import OpenVINOExpertBackend
-from .router import ExpertRouter
+from .router import ExpertRouter, routers_from_gguf
 from .embedding import EmbeddingLookup, LMHead, sample
 from .transformer import TransformerBlock
 
@@ -97,13 +97,17 @@ class Qwen3MoEModel:
             dequant_fn=dequant_fn,
         )
 
-        # Build router (placeholder — real router uses actual gate weights)
-        self.router = ExpertRouter(
-            hidden_size=self.hidden_size,
-            num_experts=self.num_experts,
-            top_k=int(reader.fields[f"{arch}.expert_used_count"].parts[-1][0]),
-            seed=42,
+        # Un router per layer: ffn_gate_inp.weight e' (2048, 256) e cambia
+        # in ogni strato. Un router unico condiviso farebbe selezionare lo
+        # stesso set di expert in tutti i 40 layer.
+        self.top_k = int(reader.fields[f"{arch}.expert_used_count"].parts[-1][0])
+        self.routers = routers_from_gguf(
+            self.tmap, self.block_count, self.hidden_size, self.num_experts,
+            self.top_k, arch=arch,
         )
+        # Compatibilita': i call site che leggono model.router continuano a
+        # funzionare e ottengono il router del layer 0.
+        self.router = self.routers[0]
 
         # Build transformer blocks
         self.blocks: list[TransformerBlock] = []
@@ -177,7 +181,7 @@ class Qwen3MoEModel:
                 qkv_weight=qkv_w,
                 attn_gate_weight=gate_w,
                 backend=self.backend,
-                router=self.router,
+                router=self.routers[layer],
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
             )
@@ -211,7 +215,7 @@ class Qwen3MoEModel:
                 q_k_norm=qk_norm_w,
                 k_k_norm=k_norm_w,
                 backend=self.backend,
-                router=self.router,
+                router=self.routers[layer],
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
             )

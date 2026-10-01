@@ -13,9 +13,10 @@ from flash_moe import (
     AsyncExpertStore,
     OpenVINOExpertBackend,
     ExpertRouter,
+    synthetic_router,
     MoEEngine,
     pack_expert,
-    pack_f32,
+    pack_f16,
     write_manifest,
 )
 
@@ -27,10 +28,13 @@ def build_mock_qwen_moe_weights(root: Path, num_layers: int = 2, num_experts: in
     for layer in range(num_layers):
         for eid in range(num_experts):
             key = ExpertKey(layer, eid)
+            # f16: e' il formato con cui il backend legge gli expert non
+            # quantizzati. Con pack_f32 i byte verrebbero riletti come f16 e
+            # il conteggio degli elementi risulterebbe doppio.
             tensors = {
-                "gate": pack_f32(np.random.randn(inter_dim * hidden_dim).astype(np.float32).tolist()),
-                "up": pack_f32(np.random.randn(inter_dim * hidden_dim).astype(np.float32).tolist()),
-                "down": pack_f32(np.random.randn(hidden_dim * inter_dim).astype(np.float32).tolist()),
+                "gate": pack_f16(np.random.randn(inter_dim * hidden_dim).astype(np.float16).tolist()),
+                "up": pack_f16(np.random.randn(inter_dim * hidden_dim).astype(np.float16).tolist()),
+                "down": pack_f16(np.random.randn(hidden_dim * inter_dim).astype(np.float16).tolist()),
             }
             records.append(pack_expert(root, key, tensors))
 
@@ -66,14 +70,22 @@ def main():
         # 3. Inizializzazione Backend OpenVINO (GPU Intel Arc 130V)
         backend = OpenVINOExpertBackend(store, device="GPU")
 
-        # 4. Router Qwen MoE Top-K con Softmax
-        router = ExpertRouter(hidden_size=hidden_dim, num_experts=num_experts_per_layer, top_k=top_k)
+        # 4. Router MoE: uno per layer. Su questo benchmark i pesi sono
+        # sintetici, quindi il gate e' finto ma deterministico e diverso per
+        # layer; sul modello vero i gate vengono da ffn_gate_inp.weight.
+        routers = {
+            layer: synthetic_router(
+                hidden_size=hidden_dim, num_experts=num_experts_per_layer,
+                top_k=top_k, seed=7, layer=layer,
+            )
+            for layer in range(num_layers)
+        }
 
         # 5. Engine MoE con Lookahead Prefetching
         engine = MoEEngine(
             store=store,
             backend=backend,
-            router=router,
+            routers=routers,
             hidden_size=hidden_dim,
             intermediate_size=inter_dim,
         )

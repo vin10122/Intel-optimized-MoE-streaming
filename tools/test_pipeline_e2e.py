@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from flash_moe import (  # noqa: E402
     ExpertKey,
     AsyncExpertStore,
-    ExpertRouter,
+    synthetic_router,
     OpenVINOExpertBackend,
     MoEEngine,
 )
@@ -167,8 +167,8 @@ def main() -> int:
 
     # E. MoEEngine orchestration
     print("\n--- MoEEngine.process_token (layer 0, seed 42) ---")
-    router = ExpertRouter(HIDDEN, 256, top_k=8, seed=42)
-    engine = MoEEngine(store, backend, router, HIDDEN, INTER)
+    router = synthetic_router(HIDDEN, 256, top_k=8, seed=42, layer=0)
+    engine = MoEEngine(store, backend, {0: router}, HIDDEN, INTER)
     out_engine = engine.process_token(0, x.tolist())
     check("process_token ritorna lista di lunghezza corretta",
           isinstance(out_engine, list) and len(out_engine) == HIDDEN,
