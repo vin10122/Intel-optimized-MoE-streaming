@@ -13,6 +13,7 @@ from .rope import RoPE, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .backend_ov import OpenVINOExpertBackend
 from .router import ExpertRouter, routers_from_gguf
+from .shared_expert import SharedExpert
 from .embedding import EmbeddingLookup, LMHead, sample
 from .transformer import TransformerBlock
 
@@ -109,6 +110,17 @@ class Qwen3MoEModel:
         # funzionare e ottengono il router del layer 0.
         self.router = self.routers[0]
 
+        # Shared expert: MLP denso che OGNI token attraversa, oltre ai top-k
+        # selezionati dal router. Senza, l'output di ogni layer e' sbagliato.
+        self.shared_expert = None
+        if "blk.0.ffn_gate_shexp.weight" in self.tmap:
+            self.shared_expert = SharedExpert(
+                gguf_path, num_layers=self.block_count,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                dequant_fn=dequant_fn,
+            )
+
         # Build transformer blocks
         self.blocks: list[TransformerBlock] = []
         for layer in range(self.block_count):
@@ -184,6 +196,7 @@ class Qwen3MoEModel:
                 router=self.routers[layer],
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
+                shared_expert=self.shared_expert,
             )
         else:
             q_w = self._get_tensor(f"blk.{layer}.attn_q.weight")
@@ -218,6 +231,7 @@ class Qwen3MoEModel:
                 router=self.routers[layer],
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
+                shared_expert=self.shared_expert,
             )
 
     def init_caches(self) -> None:

@@ -3,6 +3,7 @@ from typing import Any
 from .key import ExpertKey
 from .store import AsyncExpertStore
 from .router import ExpertRouter
+from .moe_layer import run_moe_layer
 
 class MoEEngine:
     """Flash-MoE Inference Engine managing layer execution, expert routing and async look-ahead prefetching."""
@@ -52,32 +53,18 @@ class MoEEngine:
         if next_expert_key is not None:
             self.store.prefetch(next_expert_key)
 
-        # 2. Select top-k experts and compute routing weights
-        expert_ids, weights = self.router_for(layer).route(activation)
-        keys = [ExpertKey(layer, expert_id) for expert_id in expert_ids]
-
-        # 3. Accoda tutta la decisione di routing in un colpo. Con 4 worker
-        # le 8 letture girano in parallelo invece che in fila: 5,7 ms contro
-        # 19,2 ms a cache svuotata. Non e' un prefetch a due layer di
-        # distanza, perche' quello non puo' esistere: E_{L+1} dipende
-        # dall'output di E_L. E' il parallelismo interno al layer.
-        self.store.prefetch_many(keys)
-
-        # 4. Execute active experts and compute weighted output sum
-        combined_output = np.zeros(self.hidden_size, dtype=np.float32)
-        for key, weight in zip(keys, weights):
-            # No store.get() here: it would concatenate the whole expert just
-            # to throw it away. backend.forward() -> store.read_tensor() takes
-            # the prefetch path and only pulls the tensor it needs.
-            expert_out = self.backend.forward(key, activation, self.hidden_size, self.intermediate_size)
-            combined_output += weight * np.asarray(expert_out, dtype=np.float32)
-
-        # 5. Contributo dello shared expert: NON e' uno degli 8 selezionati dal
-        # router, e ogni token lo attraversa. Va sommato dopo gli expert, non
-        # pesato: si somma al totale, gia' scalato dal suo gate sigmoid.
-        if self.shared_expert is not None:
-            shared_out = self.shared_expert.forward(layer, activation)
-            if shared_out is not None:
-                combined_output += shared_out
+        # 2-5. Routing, esecuzione degli expert e contributo dello shared
+        # expert: calcolati in flash_moe.moe_layer, l'unica implementazione.
+        # TransformerBlock chiama la stessa funzione, cosi' i due percorsi non
+        # possono divergere.
+        combined_output = run_moe_layer(
+            layer=layer,
+            activation=activation,
+            router=self.router_for(layer),
+            backend=self.backend,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            shared_expert=self.shared_expert,
+        )
 
         return combined_output.tolist()

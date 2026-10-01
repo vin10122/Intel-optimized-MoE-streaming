@@ -11,6 +11,7 @@ from .rope import RoPE, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .backend_ov import OpenVINOExpertBackend
 from .router import ExpertRouter
+from .moe_layer import run_moe_layer
 
 
 class TransformerBlock:
@@ -46,6 +47,7 @@ class TransformerBlock:
         router: ExpertRouter | None = None,
         intermediate_size: int = 512,
         num_experts: int = 256,
+        shared_expert: Any = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -93,6 +95,9 @@ class TransformerBlock:
 
         self.backend = backend
         self.router = router
+        # Ogni token attraversa anche lo shared expert: senza, l'output del
+        # layer e' sbagliato. Passato dal modello, che lo carica una volta.
+        self.shared_expert = shared_expert
 
     def init_kv_cache(self, max_seq_len: int) -> None:
         if self.is_combined:
@@ -181,11 +186,12 @@ class TransformerBlock:
         return out
 
     def _moe_forward(self, x: np.ndarray) -> np.ndarray:
-        """Runs MoE MLP forward using the backend + this layer's router.
+        """Output MoE del layer su tutta la sequenza.
 
-        Il router e' quello del layer: i gate ffn_gate_inp.weight cambiano in
-        ogni strato, quindi un router condiviso selezionerebbe lo stesso set
-        di expert 40 volte.
+        Chiama flash_moe.moe_layer.run_moe_layer, la stessa funzione usata da
+        MoEEngine: il calcolo del layer MoE e' definito in un punto solo, con
+        la somma dei top-k e il contributo dello shared expert. Qui non ci
+        era nessuna copia da mantenere allineata.
         """
         if self.backend is None or self.router is None:
             return x  # identity if no MoE
@@ -194,18 +200,15 @@ class TransformerBlock:
         result = np.zeros_like(x)
         for si in range(s):
             activation = x[0, si, :]
-            expert_ids, weights = self.router.route(activation)
-            keys = [ExpertKey(self.layer_idx, eid) for eid in expert_ids]
-            # Accoda tutta la decisione di routing: con piu' worker le
-            # letture dei 8 expert girano in parallelo. Stesso path del
-            # backend, che su questo oggetto conosce gia' lo store.
-            if self.backend is not None and hasattr(self.backend, "store"):
-                self.backend.store.prefetch_many(keys)
-            combined = np.zeros(self.hidden_size, dtype=np.float32)
-            for key, weight in zip(keys, weights):
-                expert_out = self.backend.forward(key, activation.tolist(), self.hidden_size, self.intermediate_size)
-                combined += weight * np.asarray(expert_out, dtype=np.float32)
-            result[0, si, :] = combined
+            result[0, si, :] = run_moe_layer(
+                layer=self.layer_idx,
+                activation=activation,
+                router=self.router,
+                backend=self.backend,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                shared_expert=self.shared_expert,
+            )
         return result
 
     def forward(
