@@ -1,7 +1,7 @@
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .key import ExpertKey, StoreStats
 
@@ -135,17 +135,39 @@ class RAMBoundedExpertStore(ExpertStore):
 
 
 class AsyncExpertStore(RAMBoundedExpertStore):
-    """Asynchronous look-ahead pre-fetching expert store.
+    """Store con prefetch asincrono e letture in parallelo.
 
     A prefetch submits only the expert's own tensor ranges to the executor.
     The future holds the loaded tensors; the cache is mutated exclusively by
     the calling thread when it consumes the future, so no lock is needed and
     a prefetched-but-unused expert never pollutes the LRU.
+
+    Sul numero di worker. ``max_workers=1`` serializzava le 8 letture di un
+    layer: misurate a cache svuotata su questo disco, 8 regioni sparse nel
+    file da 17 GiB costano 19,2 ms in sequenza e 5,7 ms con 4 thread, cioe'
+    3,4x. Oltre i 4 non si guadagna piu' (6,2 ms con 8, 5,4 ms con 16):
+    la coda del dispositivo e' satura e altri thread aggiungono solo
+    contesa. Il default 4 viene da quella misura, non da un numero scelto.
+
+    Sul prefetch che non nasconde la latenza. Su un singolo token la catena
+    e' strettamente sequenziale: gli expert del layer L+1 si conoscono solo
+    dopo che l'output del layer L e' stato calcolato, e a quel punto sono
+    gia' stati letti quelli del layer L. Non c'e' lavoro da sovrapporre.
+    Quello che il batch porta e' il parallelismo fra gli 8 expert dello
+    stesso layer. Per nascondere davvero l'I/O servirebbero almeno due
+    token in volo, cioe' un pipeline: e' un cambiamento architetturale
+    diverso, non un parametro.
     """
 
-    def __init__(self, root: str | Path, capacity: int = 2, manifest: Any = None):
+    DEFAULT_WORKERS = 4
+
+    def __init__(self, root: str | Path, capacity: int = 2, manifest: Any = None,
+                 workers: int | None = None):
         super().__init__(root, capacity, manifest)
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        if workers is not None and workers < 1:
+            raise ValueError(f"workers must be at least 1, got {workers}")
+        self.workers = self.DEFAULT_WORKERS if workers is None else workers
+        self.executor = ThreadPoolExecutor(max_workers=self.workers)
         self.pending_loads: dict[ExpertKey, Future] = {}
 
     def prefetch(self, key: ExpertKey) -> None:
@@ -154,6 +176,25 @@ class AsyncExpertStore(RAMBoundedExpertStore):
         if self.manifest is None and not self._path_for(key).exists():
             return
         self.pending_loads[key] = self.executor.submit(self._read_expert, key)
+
+    def prefetch_many(self, keys: Iterable[ExpertKey]) -> int:
+        """Accoda in un colpo tutti gli expert di una decisione di routing.
+
+        E' questo il punto in cui il routing guidato serve: gli indici non
+        sono un'anticipazione inventata ma l'output reale di
+        ``ExpertRouter.route``, quindi gli expert da leggere sono noti prima
+        di iniziare a leggerli. Restituisce quanti sono stati accodati
+        davvero, esclusi quelli gia' in cache o gia' in coda.
+        """
+        queued = 0
+        for key in keys:
+            if key in self._cache or key in self.pending_loads:
+                continue
+            if self.manifest is None and not self._path_for(key).exists():
+                continue
+            self.pending_loads[key] = self.executor.submit(self._read_expert, key)
+            queued += 1
+        return queued
 
     def _consume(self, key: ExpertKey) -> dict[str, bytes] | None:
         future = self.pending_loads.pop(key, None)
@@ -174,7 +215,7 @@ class AsyncExpertStore(RAMBoundedExpertStore):
             return cached
         prefetched = self._consume(key)
         if prefetched is not None:
-            self.stats.hits += 1
+            self.stats.prefetch_hits += 1
             return prefetched
         tensors = self._read_expert(key)
         self.stats.misses += 1
@@ -193,7 +234,7 @@ class AsyncExpertStore(RAMBoundedExpertStore):
 
         prefetched = self._consume(key)
         if prefetched is not None:
-            self.stats.hits += 1
+            self.stats.prefetch_hits += 1
             self.stats.tensor_reads += 1
             return prefetched[name]
 
@@ -211,7 +252,7 @@ class AsyncExpertStore(RAMBoundedExpertStore):
             return b"".join(cached.values())
         prefetched = self._consume(key)
         if prefetched is not None:
-            self.stats.hits += 1
+            self.stats.prefetch_hits += 1
             return b"".join(prefetched.values())
         tensors = self._read_expert(key)
         self.stats.misses += 1

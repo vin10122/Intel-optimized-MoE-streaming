@@ -186,6 +186,8 @@ def main() -> int:
     print(f"  token/s (est.) : {1.0/dt:.2f}")
     print(f"  cache misses   : {store.stats.misses}")
     print(f"  cache hits     : {store.stats.hits}")
+    print(f"  prefetch hits  : {store.stats.prefetch_hits}")
+    print(f"  expert da SSD  : {store.stats.disk_loads}")
     print(f"  bytes da SSD   : {store.stats.bytes_read / 1024**2:.1f} MB")
 
     check(f"pipeline completa {dt < 30}", dt < 30, f"{dt:.2f}s")

@@ -118,14 +118,16 @@ def main() -> int:
     store_a.close()
 
     # ---------------------------------------------------------------- B
-    print("\n B. prefetch -> cache hit, non miss")
+    print("\n B. prefetch -> prefetch_hit, non miss")
     store_b, _ = make_store_backend(gguf_path, layer_types_map, manifest)
     store_b.prefetch(ExpertKey(0, 30))
     store_b.read_tensor(ExpertKey(0, 30), "gate")
-    check("hit count > 0 dopo prefetch", store_b.stats.hits > 0,
-          f"hits={store_b.stats.hits}")
+    check("prefetch_hits > 0 dopo prefetch", store_b.stats.prefetch_hits > 0,
+          f"prefetch_hits={store_b.stats.prefetch_hits}")
     check("miss count == 0 dopo prefetch", store_b.stats.misses == 0,
           f"misses={store_b.stats.misses}")
+    check("hits resta 0: il prefetch non è un hit di cache",
+          store_b.stats.hits == 0, f"hits={store_b.stats.hits}")
     # Access an unfetched expert — should be a miss
     store_b.read_tensor(ExpertKey(0, 31), "gate")
     check("miss count > 0 per expert non-prefetched", store_b.stats.misses > 0,
@@ -192,9 +194,12 @@ def main() -> int:
     store_f.read_tensor(ExpertKey(0, 20), "gate")  # prefetch hit
     store_f.read_tensor(ExpertKey(0, 30), "gate")  # sync miss
     check("1 sync miss", store_f.stats.misses == 1, f"misses={store_f.stats.misses}")
-    check("2 prefetch hits", store_f.stats.hits == 2, f"hits={store_f.stats.hits}")
+    check("2 prefetch hits", store_f.stats.prefetch_hits == 2,
+          f"prefetch_hits={store_f.stats.prefetch_hits}")
     check("3 read_tensor total", store_f.stats.tensor_reads == 3,
           f"reads={store_f.stats.tensor_reads}")
+    check("disk_loads = 3 expert portati in RAM",
+          store_f.stats.disk_loads == 3, f"disk_loads={store_f.stats.disk_loads}")
     store_f.close()
 
     print("\n" + "=" * 78)

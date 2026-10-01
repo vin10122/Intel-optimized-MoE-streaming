@@ -195,9 +195,14 @@ class TransformerBlock:
         for si in range(s):
             activation = x[0, si, :]
             expert_ids, weights = self.router.route(activation)
+            keys = [ExpertKey(self.layer_idx, eid) for eid in expert_ids]
+            # Accoda tutta la decisione di routing: con piu' worker le
+            # letture dei 8 expert girano in parallelo. Stesso path del
+            # backend, che su questo oggetto conosce gia' lo store.
+            if self.backend is not None and hasattr(self.backend, "store"):
+                self.backend.store.prefetch_many(keys)
             combined = np.zeros(self.hidden_size, dtype=np.float32)
-            for expert_id, weight in zip(expert_ids, weights):
-                key = ExpertKey(self.layer_idx, expert_id)
+            for key, weight in zip(keys, weights):
                 expert_out = self.backend.forward(key, activation.tolist(), self.hidden_size, self.intermediate_size)
                 combined += weight * np.asarray(expert_out, dtype=np.float32)
             result[0, si, :] = combined

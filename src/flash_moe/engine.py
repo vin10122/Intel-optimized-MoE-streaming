@@ -40,17 +40,28 @@ class MoEEngine:
         activation: list[float] | np.ndarray,
         next_expert_key: ExpertKey | None = None,
     ) -> list[float]:
-        # 1. Trigger look-ahead prefetch for next token/expert
+        # 1. Hint opzionale del chiamante. Non serve perche' il routing qui
+        # sotto e' gia' noto: si mantiene solo per chi vuole anticipare un
+        # expert di un altro layer a piacere. I runner storici passavano
+        # ExpertKey(layer, (i+1) % n), cioe' un indice inventato che non
+        # corrispondeva a nessun expert che il layer avrebbe usato.
         if next_expert_key is not None:
             self.store.prefetch(next_expert_key)
 
         # 2. Select top-k experts and compute routing weights
         expert_ids, weights = self.router_for(layer).route(activation)
+        keys = [ExpertKey(layer, expert_id) for expert_id in expert_ids]
 
-        # 3. Execute active experts and compute weighted output sum
+        # 3. Accoda tutta la decisione di routing in un colpo. Con 4 worker
+        # le 8 letture girano in parallelo invece che in fila: 5,7 ms contro
+        # 19,2 ms a cache svuotata. Non e' un prefetch a due layer di
+        # distanza, perche' quello non puo' esistere: E_{L+1} dipende
+        # dall'output di E_L. E' il parallelismo interno al layer.
+        self.store.prefetch_many(keys)
+
+        # 4. Execute active experts and compute weighted output sum
         combined_output = np.zeros(self.hidden_size, dtype=np.float32)
-        for expert_id, weight in zip(expert_ids, weights):
-            key = ExpertKey(layer, expert_id)
+        for key, weight in zip(keys, weights):
             # No store.get() here: it would concatenate the whole expert just
             # to throw it away. backend.forward() -> store.read_tensor() takes
             # the prefetch path and only pulls the tensor it needs.
