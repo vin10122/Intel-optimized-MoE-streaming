@@ -14,6 +14,21 @@ Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precision
   la memoria e' condivisa: la GPU non ha nulla da guadagnare qui.
 * I pesi si convertono una volta sola per expert e si riutilizzano dalla cache:
   il backend non deve ricevere array float gia' dequantizzati.
+* **I pesi NON possono diventare Constant.** Misurato: un modello con i tre
+  pesi come Constant inferisce in 0,29 ms/expert contro 1,02 ms del percorso
+  con i pesi come input, quindi sembra il modo giusto. Ma compilare quel
+  modello costa 25-32 ms (misurati su 6 compilazioni, con e senza
+  ``INFERENCE_PRECISION_HINT``): un expert ricompilato ogni volta e' 30 volte
+  piu' lento di uno che riceve i pesi. Serve un hit rate del 97% per
+  ammortizzare, e su 10240 expert con 8 per layer il working set e' 320 chiavi
+  su 10240: non e' raggiungibile con una cache che stia in RAM. Mutare il
+  buffer del Constant dopo la compilazione non funziona, il plugin lo ha gia'
+  copiato (verificato: il risultato non cambia). Il percorso veloce resta
+  quindi un solo modello compilato condiviso + ``share_inputs``, che toglie la
+  copia senza toccare la compilazione.
+* **Il batch degli 8 expert non aiuta**: 8 slot in un solo infer f16 costano
+  1,65 ms/expert contro 1,08 ms di 8 infer separati. Il plugin non guadagna
+  nulla nel muoversi piu' byte alla volta, e la banda resta il collo.
 """
 
 from __future__ import annotations
@@ -75,6 +90,9 @@ class OpenVINOExpertBackend:
         # e i page fault costano 0,56 ms su 0,96 ms per tensor, cioe' il 59% del
         # tempo di dequantizzazione. Vedi tools/test_weight_pool.py.
         self._pool: dict[int, list[np.ndarray]] = {}
+        # OpenVINO >= 2022.3 accetta share_inputs. Se il parametro non esiste
+        # il fallback sopra lo spegne da solo e il backend continua a funzionare.
+        self._share_inputs = True
 
         print(f"[OpenVINOBackend] device={self.target_device} "
               f"weights={weight_dtype} available={self.core.available_devices}")
@@ -217,10 +235,33 @@ class OpenVINOExpertBackend:
         else:
             x = np.ascontiguousarray(activation, dtype=np.float32).reshape(1, hidden_size)
 
-        result = request.infer({
+        feed = {
             "activation": x,
             "gate": gate,
             "up": up,
             "down": down,
-        })
+        }
+        result = self._infer(request, feed)
         return np.asarray(list(result.values())[0], dtype=np.float32).reshape(hidden_size)
+
+    def _infer(self, request, feed: dict):
+        """Inferenza senza copia degli input.
+
+        ``share_inputs=True`` dice a OpenVINO di avvolgere gli array numpy
+        senza copiarne il contenuto in un tensor proprio. La copia costa
+        quanto il calcolo stesso: misurata sul grafo SwiGLU f16 di questo
+        modello, 6 MiB di pesi per expert, infer media 1,024 ms con la copia
+        e 0,630 ms senza, su 320 esperti per token sono 0,126 s/token.
+
+        I numeri non cambiano: gli stessi byte finiscono nel tensor, cambia
+        solo chi li sposta. Gli array restano di sola lettura per la
+        durata della chiamata, che e' sincrona, e i pesi sono gia' in cache.
+        """
+        if self._share_inputs:
+            try:
+                return request.infer(feed, share_inputs=True)
+            except TypeError:
+                # OpenVINO troppo vecchio per il parametro: si resta sul
+                # percorso con copia, che e' piu' lento ma identico.
+                self._share_inputs = False
+        return request.infer(feed)

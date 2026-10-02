@@ -187,7 +187,9 @@ Potenziale: **~24x**.
 
 | # | Azione | Gain atteso |
 |---|---|---|
-| 1 | OpenVINO: pesi come `Constant` / `share_weights`, tipo **f16** | 7,6x |
+| 1 | ~~OpenVINO: pesi come `Constant`~~ | **non applicabile**, vedi §7 |
+| 1b | OpenVINO: `share_inputs=True`, un solo modello compilato | 1,6x sulla gamba OpenVINO |
+| 1c | Shared expert: pesi materializzati in f32 una volta sola | **14,9x** su quel componente |
 | 2 | Correggere il fallback (o eliminarlo: fallire è meglio che tornare zeri) | correttezza |
 | 3 | Correggere lo store: slice nel prefetch, un solo tipo in `_cache` | correttezza |
 | 4 | Aggiungere shared expert al path di esecuzione | correttezza |
@@ -210,3 +212,83 @@ assert np.abs(out.astype(np.float32) - ref).max() < 1e-3
 
 Il kernel Q8_0 attuale non ha mai avuto questo test, ed è per questo che è
 "più veloce e sbagliato".
+
+---
+
+## 7. I pesi passati a ogni infer: cosa si può fare e cosa no
+
+La riga 1 della tabella §6 diceva "pesi come `Constant`, guadagno 7,6x". Era
+una misura di `infer()` con un modello solo, che non dice quanto costa
+produrre quel modello. Rimessa in piedi con il backend vero e un modello per
+expert, la cosa non torna.
+
+### 7a. `Constant` per expert: il guadagno c'è, l'ammortamento no
+
+Misure su CPU, grafo SwiGLU f16 di questo modello (hidden 2048, inter 512,
+6 MiB di pesi per expert), mediana di 12 infer dopo 3 di riscaldamento:
+
+| Come sono agganciati i pesi | ms/expert | s/token (320 expert) |
+|---|---|---|
+| input, con copia | 1,024 | 0,328 |
+| input, `share_inputs=True` | 0,630 | 0,202 |
+| input f32, con copia | 1,104 | 0,353 |
+| input f32, `share_inputs=True` | 0,520 | 0,166 |
+| **`Constant` nel modello** | **0,290** | **0,093** |
+
+Il `Constant` è 3,5x più veloce dell'input con copia. Ma il modello con i
+pesi dentro va **compilato**, e compilarlo costa:
+
+| Configurazione di compilazione | ms per expert |
+|---|---|
+| default, costanti f16 | 31,8 |
+| `PERFORMANCE_HINT: LATENCY` | 31,9 |
+| `PERFORMANCE_HINT: THROUGHPUT` | 33,9 |
+| `INFERENCE_PRECISION_HINT: f32` | 30,5 |
+| `INFERENCE_PRECISION_HINT: f16` | 25,1 |
+| costanti f32 | 27,9 |
+
+25-32 ms per ricompilare, contro 1,02 ms per passare i pesi come input.
+L'equazione è `(1-h)·28 + h·0,29 < 1,02`, cioè **hit rate > 97%**. Il modello
+ha 256 expert per layer e 40 layer: 10240 chiavi diverse, 8 per layer, cioè
+320 chiavi toccate a ogni token contro un working set che non sta in RAM
+(320 modelli compilati sono circa 3,8 GiB solo di pesi). Non c'è.
+
+Nemmeno le scorciatoie funzionano:
+
+* **mutare il buffer del `Constant` dopo la compilazione**: l'output non
+  cambia. Il plugin si è già copiato i pesi, e questa OpenVINO (2026.4) non ha
+  né `Model.set_shared_weights` né `InferRequest.set_weights`, quindi non c'è
+  proprio l'API per riaprire i pesi su un modello già compilato;
+* **batch degli 8 expert in un solo infer** (8 slot affiancati nei tre
+  tensor): 13,2 ms per gli 8, cioè 1,65 ms/expert, contro 1,08 ms di otto
+  infer separati. Il plugin non guadagna nulla spostando più byte alla volta
+  e la banda resta il collo.
+
+### 7b. Cosa è invece applicabile: `share_inputs=True`
+
+Un solo modello compilato, condiviso da tutti gli expert, con i pesi che
+arrivano come numpy **senza copia**: `InferRequest.infer(..., share_inputs=True)`
+avvolge gli array in un tensor che ne condivide la memoria invece di
+copiarli. Il backend reale passa da **1,050 a 0,777 ms/expert**. Nessun
+costo in RAM, nessuna compilazione in più, stessi identici byte nel tensor:
+cambia solo chi li sposta. Con OpenVINO più vecchi che non hanno il
+parametro il backend ricade da solo sul percorso con copia.
+
+### 7c. Il componente che costava di più non era OpenVINO
+
+Il `SharedExpert` gira in NumPy e a ogni token, per ogni layer, faceva
+`weights.astype(np.float32)` su tre tensor da 1M di elementi. Sono pesi che
+non cambiano mai, e il cast rifatto a ogni token costava 2,08 ms per tensor:
+
+| | ms/layer | ms/token (40 layer) | tok/s da solo |
+|---|---|---|---|
+| cast dei pesi a ogni token | 6,8 | 308,7 | 3,2 |
+| pesi in f32 dal caricamento | 0,48 | 20,7 | **48,4** |
+
+**14,9x.** I numeri non cambiano: `astype(np.float32)` su un array f16 è
+esatta, cambia solo quando avviene. Costo: i 240 MiB di f16 diventano 480 MiB
+di f32.
+
+Le tre cose insieme portano la gamba FFN da ~0,85 s/token a ~0,42 s/token.
+Quel che resta è il dequant e la lettura delle slice dal GGUF, non il passaggio
+dei pesi a OpenVINO.

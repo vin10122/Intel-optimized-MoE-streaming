@@ -62,7 +62,7 @@ check("2 layer caricati", len(se.layers) == 2, f"({sorted(se.layers)})")
 for role, want in (("gate_inp", (H,)), ("gate", (H, I)),
                    ("up", (H, I)), ("down", (I, H))):
     got = se.layers[0][role].shape
-    check(f"pesi {role} {got}", got == want, f"atteso {want} dtype f16")
+    check(f"pesi {role} {got}", got == want, f"atteso {want} dtype f32")
 
 rng = np.random.default_rng(0)
 x = rng.standard_normal(H).astype(np.float32)

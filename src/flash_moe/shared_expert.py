@@ -94,12 +94,21 @@ def shared_expert_present(tensor_map: dict, layer: int) -> bool:
 
 
 class SharedExpert:
-    """Shared expert di tutti i layer, con i pesi in f16 tenuti in memoria.
+    """Shared expert di tutti i layer, con i pesi tenuti in memoria.
 
     Sono 4 tensor per layer (2,5 MiB per layer in Q6_K, ~100 MiB per i 40
     layer in f16), e servono a ogni token, quindi non c'e' nulla da guadagnare
     tenendoli su disco: si caricano una volta e restano. Si caricano per
     intero e non a slice, perche' sono piccoli e servono sempre.
+
+    **I pesi si materializzano in f32 al caricamento, non a ogni token.** Il
+    calcolo e' un BLAS che richiede f32, e ``array.astype(np.float32)`` su 3
+    tensor da 1M di elementi costa 2,08 ms per tensor: rifatto a ogni token
+    erano 6,8 ms per layer, cioe' 309 ms per i 40 layer, 3,2 tok/s da soli,
+    di cui 250 ms/token sono solo il cast. La conversione e' esatta (f16 -> f32
+    non perde cifre) e i numeri non cambiano: cambia solo quando avviene.
+    Costo: 240 MiB di f16 diventano 480 MiB di f32, e il cast di prima fascia
+    finisce nel tempo di caricamento.
     """
 
     def __init__(self, gguf_path: str | Path, num_layers: int,
@@ -123,13 +132,18 @@ class SharedExpert:
             for role, info in shared_expert_slices(tensor_map, layer).items():
                 tensor = tensor_map[f"blk.{layer}.{SHARED_ROLES[role]}"]
                 weights[role] = self._load(tensor.data, info["ggml_type"],
-                                          info["shape"])
-            self.layers[layer] = weights
+                                           info["shape"])
+            # Da qui in avanti i pesi sono f32: il BLAS li vuole cosi' e il
+            # cast e' gia' stato fatto. Le copie f16 non servono piu'.
+            self.layers[layer] = {
+                role: np.ascontiguousarray(array, dtype=np.float32)
+                for role, array in weights.items()
+            }
 
         if self.missing:
             raise KeyError(
                 f"shared expert mancante nei layer {self.missing}: senza i suoi "
-                "pesi l'output di ogni token e' sbagliato, non approssimato"
+                f"pesi l'output di ogni token e' sbagliato, non approssimato"
             )
 
     def _load(self, data: Any, ggml_type: int,
@@ -193,10 +207,13 @@ class SharedExpert:
             )
 
         # gate di scala: prodotto scalare poi sigmoid, come in llama.cpp
-        gate = _sigmoid((x @ weights["gate_inp"].astype(np.float32)).reshape(()))
+        # np.asarray, non astype: su un array gia' f32 non copia niente. Se un
+        # test o un caller riassegna un peso in f16, la conversione torna a
+        # farlo qui, una volta sola per chiamata e non per token.
+        gate = _sigmoid((x @ np.asarray(weights["gate_inp"], dtype=np.float32)).reshape(()))
 
-        g = x @ weights["gate"].astype(np.float32)
-        act = (g * _sigmoid(g)) * (x @ weights["up"].astype(np.float32))
-        out = act @ weights["down"].astype(np.float32)
+        g = x @ np.asarray(weights["gate"], dtype=np.float32)
+        act = (g * _sigmoid(g)) * (x @ np.asarray(weights["up"], dtype=np.float32))
+        out = act @ np.asarray(weights["down"], dtype=np.float32)
 
         return (gate * out).astype(np.float32)
