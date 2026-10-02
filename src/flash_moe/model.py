@@ -59,8 +59,14 @@ class Qwen3MoEModel:
         self.num_kv_heads = int(reader.fields[f"{arch}.attention.head_count_kv"].parts[-1][0])
         self.rope_dim = int(reader.fields[f"{arch}.rope.dimension_count"].parts[-1][0]) if f"{arch}.rope.dimension_count" in reader.fields else 64
         self.freq_base = float(reader.fields[f"{arch}.rope.freq_base"].parts[-1][0]) if f"{arch}.rope.freq_base" in reader.fields else 1000000.0
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = int(reader.fields[f"{arch}.attention.key_length"].parts[-1][0]) if f"{arch}.attention.key_length" in reader.fields else self.hidden_size // self.num_heads
         self.kv_head_dim = int(reader.fields[f"{arch}.attention.key_length"].parts[-1][0]) if f"{arch}.attention.key_length" in reader.fields else 256
+        vlen = int(reader.fields[f"{arch}.attention.value_length"].parts[-1][0]) if f"{arch}.attention.value_length" in reader.fields else self.kv_head_dim
+        if vlen != self.kv_head_dim:
+            raise ValueError(
+                f"attention.value_length ({vlen}) diverso da key_length "
+                f"({self.kv_head_dim}): la proiezione di uscita assume teste "
+                "dello stesso formato per Q e per K/V")
         self.eps = float(reader.fields[f"{arch}.attention.layer_norm_rms_epsilon"].parts[-1][0])
 
         self.bos_token_id = int(reader.fields["tokenizer.ggml.bos_token_id"].parts[-1][0])
@@ -209,12 +215,53 @@ class Qwen3MoEModel:
             qk_norm_w = np.asarray(qk_norm_t.data, dtype=np.float16) if qk_norm_t else None
             k_norm_w = np.asarray(k_norm_t.data, dtype=np.float16) if k_norm_t else None
 
+            # head_dim viene dai metadati (attention.key_length = 256), non da
+            # hidden/num_heads: su questa architettura Q e' il gate e la query
+            # fuse in una sola proiezione, quindi hidden/num_heads non
+            # corrisponde a nessuna delle due. I pesi sono in convenzione
+            # numpy (out, in): l'asse 0 e' l'uscita della proiezione.
+            head_dim = self.head_dim
+            if qk_norm_t is not None and int(qk_norm_t.n_elements) != head_dim:
+                raise ValueError(
+                    f"blk.{layer}.attn_q_norm.weight e' lungo "
+                    f"{int(qk_norm_t.n_elements)}, attesi {head_dim}")
+            if q_w is not None:
+                want_q = (self.num_heads * 2 * head_dim, self.hidden_size)
+                if tuple(int(s) for s in q_w.shape) != want_q:
+                    raise ValueError(
+                        f"blk.{layer}.attn_q.weight di forma "
+                        f"{tuple(int(s) for s in q_w.shape)}, attesa "
+                        f"{want_q} = ({self.num_heads} head * 2 (query + "
+                        f"gate) * {head_dim}, {self.hidden_size})")
+            if k_w is not None:
+                want_k = (self.num_kv_heads * self.kv_head_dim, self.hidden_size)
+                if tuple(int(s) for s in k_w.shape) != want_k:
+                    raise ValueError(
+                        f"blk.{layer}.attn_k.weight di forma "
+                        f"{tuple(int(s) for s in k_w.shape)}, attesa {want_k}")
+            if v_w is not None:
+                want_v = (self.num_kv_heads * self.kv_head_dim, self.hidden_size)
+                if tuple(int(s) for s in v_w.shape) != want_v:
+                    raise ValueError(
+                        f"blk.{layer}.attn_v.weight di forma "
+                        f"{tuple(int(s) for s in v_w.shape)}, attesa {want_v}")
+            if out_w is not None:
+                want_o = (self.hidden_size, self.num_heads * head_dim)
+                if tuple(int(s) for s in out_w.shape) != want_o:
+                    raise ValueError(
+                        f"blk.{layer}.attn_output.weight di forma "
+                        f"{tuple(int(s) for s in out_w.shape)}, attesa {want_o}")
+            if k_norm_w is not None and int(k_norm_w.shape[0]) != self.kv_head_dim:
+                raise ValueError(
+                    f"blk.{layer}.attn_k_norm.weight e' lungo "
+                    f"{int(k_norm_w.shape[0])}, attesi {self.kv_head_dim}")
+
             return TransformerBlock(
                 layer_idx=layer,
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
-                head_dim=512,
+                head_dim=head_dim,
                 kv_head_dim=self.kv_head_dim,
                 rope_dim=self.rope_dim,
                 freq_base=self.freq_base,

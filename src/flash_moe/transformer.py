@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import numpy as np
 
@@ -87,11 +87,13 @@ class TransformerBlock:
         self.post_attn_norm = RMSNorm(post_attn_norm_weight, eps=1e-6)
         self.eps = 1e-6
         self.kv_cache: KVCache | None = None
-
+        # pesi QK-norm grezzi: li applica AttentionLayer, non questo blocco
+        self.q_k_norm = q_k_norm
+        self.k_k_norm = k_k_norm
+        self._prepared_weights: dict[str, np.ndarray] | None = None
         if q_k_norm is not None and k_k_norm is not None:
             self.q_norm = RMSNorm(q_k_norm, eps=1e-6)
             self.k_norm = RMSNorm(k_k_norm, eps=1e-6)
-            self.attn.set_qk_norm(self.q_norm, self.k_norm)
 
         self.backend = backend
         self.router = router
@@ -100,90 +102,49 @@ class TransformerBlock:
         self.shared_expert = shared_expert
 
     def init_kv_cache(self, max_seq_len: int) -> None:
-        if self.is_combined:
-            # MHA: cache 16 heads × 128 head_dim
-            self.kv_cache = KVCache(self.attn.num_heads, 128, max_seq_len)
-        else:
-            # GQA: cache 2 kv_heads × 256 kv_head_dim
-            self.kv_cache = KVCache(self.attn.num_kv_heads, 256, max_seq_len)
+        self.attn.init_cache(max_seq_len)
+        self.kv_cache = self.attn.cache
+
+    def _attn_weights(self):
+        """Pesi dell'attenzione nel formato ggml, preparati una volta sola.
+
+        Il modello li tiene in convenzione numpy (out, in) perche' e' cosi' che
+        li carica dalla GGUF; AttentionLayer li vuole (in, out), cioe' la
+        disposizione con cui si scrive ``x @ w`` senza trasporre. La
+        trasposizione e' una vista: non copia niente.
+        """
+        if self._prepared_weights is None:
+            self._prepared_weights = self.attn.prepare_weights(
+                np.ascontiguousarray(self.q_weight.T),
+                np.ascontiguousarray(self.k_weight.T),
+                np.ascontiguousarray(self.v_weight.T),
+                self.q_k_norm, self.k_k_norm,
+                np.ascontiguousarray(self.attn_output_weight.T),
+                keep_f16=True,
+            )
+        return self._prepared_weights
 
     def _attention_forward(self, x: np.ndarray, seq_offset: int = 0) -> np.ndarray:
-        """Runs attention forward, returning (batch, seq, hidden).
+        """Attenzione del blocco su (batch, seq, hidden).
 
-        x: (batch, seq, hidden)
+        Non implementa l'attenzione: chiama AttentionLayer.forward, che e' il
+        percorso verificato. Qui c'era una seconda implementazione con lo
+        stesso calcolo ma orientamenti diversi (pesi in (out, in), gate Q
+        applicata in modo diverso, prefillo che non popolava la cache), e due
+        copie di un calcolo che si sbaglia in modi diversi sono la peggio
+        combinazione possibile.
         """
-        b, s, h = x.shape
-
         if self.is_combined:
-            qkv = x @ self.qkv_weight.T  # (b, s, 8192) = 4*hidden
-            q, k, v, extra = np.split(qkv, 4, axis=-1)
+            raise TypeError(
+                f"blk.{self.layer_idx} e' un layer SSM (Gated DeltaNet): "
+                "l'attenzione non si esegue su questo blocco, vedi "
+                "flash_moe.gated_deltanet. I layer full attention sono quelli "
+                "con full_attention_interval = 4.")
+        b, s, h = x.shape
+        flat = np.ascontiguousarray(x.reshape(b * s, h))
+        out = self.attn.forward(flat, self._attn_weights(), cache=self.attn.cache)
+        return out.reshape(b, s, h)
 
-            gate_proj = x @ self.attn_gate_weight.T  # (b, s, 4096) = 2*hidden
-            gate1, gate2 = np.split(gate_proj, 2, axis=-1)  # each (b, s, hidden)
-
-            q = self.attn._reshape_qkv(q, self.attn.num_heads, self.attn.head_dim)
-            k = self.attn._reshape_qkv(k, self.attn.num_heads, self.attn.head_dim)
-            v = self.attn._reshape_qkv(v, self.attn.num_heads, self.attn.head_dim)
-
-            if self.kv_cache is not None and seq_offset > 0:
-                new_k = k[:, :, -1:, :]
-                new_v = v[:, :, -1:, :]
-                self.kv_cache.append(new_k[0], new_v[0])
-                k_full, v_full = self.kv_cache.get()
-                k = k_full.reshape(1, self.attn.num_heads, -1, self.attn.head_dim)
-                v = v_full.reshape(1, self.attn.num_heads, -1, self.attn.head_dim)
-
-            attn_out = scaled_dot_product_attention(q, k, v, rope=self.rope, seq_offset=seq_offset)
-            b, nh, s2, d = attn_out.shape
-            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(b, s2, nh * d)
-
-            gate1_act = gate1 * (1.0 / (1.0 + np.exp(-gate1)))
-            gate2_act = gate2 * (1.0 / (1.0 + np.exp(-gate2)))
-            out = attn_out * gate1_act + extra * gate2_act
-        else:
-            # Split variant: Q head_dim=512, K/V head_dim=256, QK-norm=(256,)
-            # Q is split into [Q_attn(256 per head), Q_gate(256 per head)]
-            q_full = x @ self.q_weight.T  # (b, s, 8192)
-            k_raw = x @ self.k_weight.T   # (b, s, 512)
-            v_raw = x @ self.v_weight.T   # (b, s, 512)
-
-            # Split Q into attention part (first 4096) and gate part (last 4096)
-            q_attn, q_gate = np.split(q_full, 2, axis=-1)  # each (b, s, 4096)
-            
-            # Reshape for attention: 16 heads × 256
-            q_attn = self.attn._reshape_qkv(q_attn, self.attn.num_heads, 256)
-            k = self.attn._reshape_qkv(k_raw, self.attn.num_kv_heads, 256)
-            v = self.attn._reshape_qkv(v_raw, self.attn.num_kv_heads, 256)
-
-            # Apply QK-norm (RMSNorm with weight=256)
-            if hasattr(self, 'q_norm') and self.q_norm is not None:
-                b, nh, s3, d = q_attn.shape
-                q_attn = self.q_norm.forward(q_attn.reshape(-1, d)).reshape(b, nh, s3, d)
-            if hasattr(self, 'k_norm') and self.k_norm is not None:
-                b, nkv, s3, d = k.shape
-                k = self.k_norm.forward(k.reshape(-1, d)).reshape(b, nkv, s3, d)
-
-            if self.kv_cache is not None and seq_offset > 0:
-                new_k = k[:, :, -1:, :]
-                new_v = v[:, :, -1:, :]
-                self.kv_cache.append(new_k[0], new_v[0])
-                k_full, v_full = self.kv_cache.get()
-                k = k_full.reshape(1, self.attn.num_kv_heads, -1, 256)
-                v = v_full.reshape(1, self.attn.num_kv_heads, -1, 256)
-
-            # Use this block's RoPE (256-dim for split variant)
-            attn_out = scaled_dot_product_attention(q_attn, k, v, rope=self.rope, seq_offset=seq_offset)
-            b, nh, s2, d = attn_out.shape
-            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(b, s2, nh * d)  # (b, s, 4096)
-
-            # Apply Q gate (SiLU)
-            q_gate_act = q_gate * (1.0 / (1.0 + np.exp(-q_gate)))
-            gated = attn_out * q_gate_act  # (b, s, 4096)
-
-            # Output projection: (4096, 2048) → 2048
-            out = gated @ self.attn_output_weight.T  # (b, s, 2048)
-
-        return out
 
     def _moe_forward(self, x: np.ndarray) -> np.ndarray:
         """Output MoE del layer su tutta la sequenza.
@@ -220,11 +181,11 @@ class TransformerBlock:
         """Full transformer block forward.
 
         Architecture (Qwen3):
-        1. attn_norm(x) → attention → residual
-        2. post_attn_norm(h) → MoE MLP → residual
+        1. attn_norm(x) â†’ attention â†’ residual
+        2. post_attn_norm(h) â†’ MoE MLP â†’ residual
 
         Args:
-            x: (batch, seq, hidden) — pre-norm input
+            x: (batch, seq, hidden) â€” pre-norm input
             seq_offset: Position in KV cache for autoregressive decoding
             moe_activation: Optional pre-computed activation for the MoE layer
         """

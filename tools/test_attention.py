@@ -1,217 +1,327 @@
-"""Test attention layer vs gguf.quants reference.
+"""Il layer di attenzione di Qwen3.5-MoE, verificato su forme non quadrate.
 
-Tests both attention variants:
-  - Combined QKV (layer 0: F16)
-  - Split Q/K/V with QK-norm (layer 3: Q4_K/Q6_K)
+Il motivo di questo test e' dichiarato nel file: con
+``head_dim == hidden_size`` un errore di orientamento di un peso non cambia
+la forma e passa. Con ``head_dim`` e ``hidden`` diversi, un errore di verso
+diventa un errore di forma, quindi qui si controlla esplicitamente.
+
+Le verifiche sono su una reference indipendente scritta con l'equazione
+esplicita dell'attenzione, non riutilizzando le funzioni del modulo: se il
+modulo e la reference condividessero un errore, il confronto passerebbe.
 """
-from __future__ import annotations
-
 import sys
+sys.path.insert(0, 'src')
+
+# La console Windows e' cp1252: senza questo, un'etichetta con '≈' o '→' fa
+# fallire il test su un errore di codifica invece che sull'assunto verificato.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import numpy as np
-from pathlib import Path
 
-import gguf
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-
-from flash_moe import (  # noqa: E402
-    RoPE,
-    RMSNorm,
+from flash_moe.attention import (
+    AttentionLayer, KVCache, grouped_attention, _sigmoid,
 )
-from flash_moe.dequant import name_of  # noqa: E402
-from flash_moe.attention import AttentionLayer  # noqa: E402
-from flash_moe.paths import model_path  # noqa: E402
+from flash_moe.rope import RoPE
 
-HIDDEN = 2048
-N_HEADS = 16
-N_KV_HEADS = 2
-ROPE_DIM = 64
-FREQ_BASE = 1_000_000.0
+ok = bad = 0
+def check(label, cond, detail=""):
+    global ok, bad
+    if cond:
+        ok += 1; print(f"  PASS  {label}  ({detail})")
+    else:
+        bad += 1; print(f"  FAIL  {label}  ({detail})")
 
-PASSED = []
-FAILED = []
+# forme NON quadrate e GQA con gruppo > 1
+HIDDEN, NH, NKV, HD = 12, 4, 2, 3
+ROPE_D = 2                       # ruota le prime 2 componenti su head_dim 3
+EPS = 1e-6
+rng = np.random.default_rng(7)
 
-def check(name, ok, detail=""):
-    (PASSED if ok else FAILED).append(name if ok else (name, detail))
-    tag = "  PASS  " if ok else "  FAIL  "
-    print(f"{tag}{name}" + (f"  ({detail})" if detail else ""), flush=True)
+layer = AttentionLayer(hidden_size=HIDDEN, num_heads=NH, num_kv_heads=NKV,
+                       head_dim=HD, rope_dim=ROPE_D, freq_base=10000.0,
+                       eps=EPS)
+w = layer.prepare_weights(
+    rng.standard_normal((HIDDEN, NH * 2 * HD)).astype(np.float32),
+    rng.standard_normal((HIDDEN, NKV * HD)).astype(np.float32),
+    rng.standard_normal((HIDDEN, NKV * HD)).astype(np.float32),
+    rng.standard_normal(HD).astype(np.float32),
+    rng.standard_normal(HD).astype(np.float32),
+    rng.standard_normal((NH * HD, HIDDEN)).astype(np.float32),
+)
 
+def ref(x, seq_offset=0, kprev=None, vprev=None):
+    """Reference indipendente, scritta con le formule esplicite."""
+    T = x.shape[0]
+    qf = x @ w["q"]
+    kf = x @ w["k"]
+    vf = x @ w["v"]
+    # Q/gate interleaved per testa
+    q = np.zeros((T, NH, HD), np.float32)
+    g = np.zeros((T, NH, HD), np.float32)
+    for h in range(NH):
+        q[:, h, :] = qf[:, h * 2 * HD: h * 2 * HD + HD]
+        g[:, h, :] = qf[:, h * 2 * HD + HD: (h + 1) * 2 * HD]
+    k = kf.reshape(T, NKV, HD)
+    v = vf.reshape(T, NKV, HD)
 
-def numpy_softmax(x, axis=-1):
-    x_max = np.max(x, axis=axis, keepdims=True)
-    e = np.exp(x - x_max)
-    return e / np.sum(e, axis=axis, keepdims=True)
+    def rk(a, wgt):                      # RMSNorm su head_dim
+        r = np.sqrt(np.mean(a * a, axis=-1, keepdims=True) + EPS)
+        return a / r * wgt
 
+    q = rk(q, w["q_norm"])
+    k = rk(k, w["k_norm"])
 
-def get_weight(t):
-    """Get weight as float32 from a GGUF tensor, handling quantized types."""
-    if t.tensor_type == 1:  # F16
-        return t.data.astype(np.float32)
-    raw = t.data.tobytes()
-    return gguf.quants.dequantize(np.frombuffer(raw, dtype=np.uint8), t.tensor_type).astype(np.float32)
+    rope = RoPE(head_dim=HD, rope_dim=ROPE_D, freq_base=10000.0)
+    def rot(a):                          # coppie NeoX (j, j+1) su ROPE_D=2
+        ang = np.arange(ROPE_D // 2) * (2.0 * np.arange(ROPE_D // 2) / ROPE_D)
+        c = np.cos(ang); s = np.sin(ang)
+        out = a.copy()
+        for p in range(seq_offset, seq_offset + T):
+            th = p * (1.0 / (10000.0 ** (2.0 * np.arange(ROPE_D // 2) / ROPE_D)))
+            cc = np.cos(th); ss = np.sin(th)
+            for h in range(a.shape[1]):
+                for j in range(ROPE_D // 2):
+                    x0 = a[p - seq_offset, h, j]
+                    x1 = a[p - seq_offset, h, j + ROPE_D // 2]
+                    out[p - seq_offset, h, j] = x0 * cc[j] - x1 * ss[j]
+                    out[p - seq_offset, h, j + ROPE_D // 2] = x0 * ss[j] + x1 * cc[j]
+        return out
 
+    q = rot(q)
+    k = rot(k)
 
-def main() -> int:
-    gguf_path = model_path()
-    print("=" * 78)
-    print(" TEST ATTENTION: implementation vs NumPy f32 reference")
-    print("=" * 78)
+    # cache: (seq, n_kv, head_dim) -- k e v sono gia' in quest'ordine
+    if kprev is None:
+        kk = k
+        vv = v
+    else:
+        kk = np.concatenate([kprev, k], axis=0)
+        vv = np.concatenate([vprev, v], axis=0)
 
-    reader = gguf.GGUFReader(gguf_path)
-    tmap = {t.name: t for t in reader.tensors}
+    scale = 1.0 / np.sqrt(HD)
 
-    rng = np.random.default_rng(42)
-    x = rng.standard_normal((1, 4, HIDDEN)).astype(np.float32) * 0.1  # batch=1, seq=4
+    # GQA per gruppi: la testa di query h prende il kv-head h // (n_head/n_kv).
+    # Confermato dalla reference OpenVINO di llama.cpp
+    # (ggml/src/ggml-openvino/openvino/op/flash_attn_ext.cpp:149), che rimappa
+    # Q a [B, n_kv, factor, S_q, head_size]: kv_head = h // factor.
+    # Il delta net e' diverso (h % n_kv) e non va confuso con questo.
+    out = np.zeros((T, NH, HD), np.float32)
+    for t in range(T):
+        qpos = seq_offset + t
+        for h in range(NH):
+            kk_h = kk[:, h // (NH // NKV), :]   # (seq, dim)
+            vv_h = vv[:, h // (NH // NKV), :]
+            sc = (kk_h @ q[t, h]) * scale
+            sc = np.where(np.arange(kk_h.shape[0]) <= qpos, sc, -np.inf)
+            sc = sc - sc.max()
+            e = np.exp(sc)
+            p = e / e.sum()
+            out[t, h, :] = p @ vv_h
+    out = out.reshape(T, NH * HD)
+    out = out * (1.0 / (1.0 + np.exp(-g.reshape(T, -1))))
+    return out @ w["out"], k, v
 
-    # =====================================================================
-    # Test 1: Combined QKV variant (layer 0, F16)
-    print("\n--- Combined QKV variant (layer 0, F16) ---")
-    layer = 0
+print("1. un passo: il layer coincide con la reference esplicita")
+x = rng.standard_normal((1, HIDDEN)).astype(np.float32)
+got = layer.forward(x, w)
+want, _, _ = ref(x)
+rel = float(np.abs(got - want).max() / np.abs(want).max())
+check("un token", rel < 1e-5, f"rel={rel:.2e}")
 
-    qkv_t = tmap["blk.0.attn_qkv.weight"]
-    gate_t = tmap["blk.0.attn_gate.weight"]
+print("\n2. piu' token insieme (prefill)")
+x3 = rng.standard_normal((3, HIDDEN)).astype(np.float32)
+got = layer.forward(x3, w)
+want, _, _ = ref(x3)
+rel = float(np.abs(got - want).max() / np.abs(want).max())
+check("tre token", rel < 1e-5, f"rel={rel:.2e}")
 
-    qkv_w = get_weight(qkv_t).reshape(8192, 2048)
-    gate_w = get_weight(gate_t).reshape(4096, 2048)
+print("\n3. Q e gate sono interleaved per testa, non separati a meta'")
+# attivo il gate di una sola testa: se l'impaginazione fosse sbagliata,
+# l'effetto cadrebbe su un'altra testa
+xg = np.zeros((1, HIDDEN), np.float32)
+xg[:] = 0.01
+q_gate_on_head1 = w["q"].copy()
+for h in range(NH):
+    if h != 1:
+        q_gate_on_head1[:, h * 2 * HD + HD: (h + 1) * 2 * HD] = 0.0
+wg = {k: (q_gate_on_head1 if k == "q" else w[k]) for k in w}
+y0 = layer.forward(xg, wg)
+# con tutti i gate a zero l'output e' nullo
+wzero = {k: (w["q"].copy() if k == "q" else w[k]) for k in w}
+for h in range(NH):
+    wzero["q"][:, h * 2 * HD + HD: (h + 1) * 2 * HD] = 0.0
+y_zero = layer.forward(xg, wzero)
+# Il gate e' un sigmoid moltiplicativo, quindi nullo non e' raggiungibile con
+# un peso (manca il bias): con i pesi del gate a zero la pre-attivazione e' 0 e
+# il gate vale sigmoid(0) = 0.5 esatto. Lo si verifica contro il caso in cui
+# lo stesso blocco e' moltiplicato per 1: si forza sigmoid -> 1 con un peso
+# grande e positivo sul gate di tutte le teste.
+w_one = {k: (w["q"].copy() if k == "q" else w[k]) for k in w}
+for h in range(NH):
+    w_one["q"][:, h * 2 * HD + HD: (h + 1) * 2 * HD] = 1e4
+y_one = layer.forward(xg, w_one)
+check("gate nullo (pesi 0) = metà di gate aperto (sigmoid(0) = 0.5)",
+      abs(float(np.abs(y_zero).max()) - 0.5 * float(np.abs(y_one).max())) < 1e-6,
+      f"max|y_zero|={float(np.abs(y_zero).max()):.4f} vs "
+      f"0.5*max|y_one|={0.5 * float(np.abs(y_one).max()):.4f}")
+check("gate attivo su una sola testa produce output non nullo",
+      float(np.abs(y0).max()) > 1e-6, f"max|y|={float(np.abs(y0).max()):.2e}")
+# e l'output deve dipendere SOLO dal gate della testa 1
+w_h2 = {k: (w["q"].copy() if k == "q" else w[k]) for k in w}
+for h in (0, 2, 3):
+    w_h2["q"][:, h * 2 * HD + HD: (h + 1) * 2 * HD] = 0.0
+y_h2 = layer.forward(xg, w_h2)
+y_h2b = layer.forward(xg, w_h2)
+check("output deterministico a parità di pesi",
+      np.array_equal(y_h2, y_h2b), "")
+# spegnere il gate della testa 1 cambia l'output
+w_h2_off = {k: (w_h2["q"].copy() if k == "q" else w_h2[k]) for k in w}
+w_h2_off["q"][:, 1 * 2 * HD + HD: 2 * 2 * HD] = 0.0
+y_off = layer.forward(xg, w_h2_off)
+check("le teste hanno gate indipendenti",
+      float(np.abs(y_h2 - y_off).max()) > 1e-6,
+      f"max|d|={float(np.abs(y_h2 - y_off).max()):.2e}")
 
-    print(f"  attn_qkv: {qkv_w.shape}, attn_gate: {gate_w.shape}")
-    print(f"  QKV split: Q(2048) + K(2048) + V(2048) + gate(2048)")
-    print(f"  attn_gate: (4096, 2048) = output projection? Or K+V?")
+print("\n4. il gate è sigmoid, non silu")
+# sigmoid e silu coincidono solo per x piccoli; per x grande divergono
+# _sigmoid accetta qualsiasi forma, quindi si verifica anche il caso
+# vettoriale: la stabilita' (non deve overfloware in exp) e' il punto.
+pos = _sigmoid(np.array([10.0], np.float32))[0]
+neg = _sigmoid(np.array([-10.0], np.float32))[0]
+mid = _sigmoid(np.array([0.0], np.float32))[0]
+check("sigmoid(10) = 0.99995", abs(float(pos) - 0.9999546) < 1e-6, f"{pos:.7f}")
+check("il gate non può superare 1 (silu(10) sarebbe 10.0)",
+      float(pos) <= 1.0, f"sigmoid={pos:.7f}")
+check("sigmoid(-10) ≈ 4.5e-5, non negativo",
+      0.0 < float(neg) < 1e-4, f"{neg:.3e}")
+check("sigmoid(0) = 0.5 esatto", abs(float(mid) - 0.5) < 1e-7, f"{mid:.7f}")
+check("sigmoid su estremi non overflowa e resta in [0, 1]",
+      bool(np.all(np.isfinite(_sigmoid(np.array([-1e4, 0.0, 1e4], np.float32)))) and
+           np.all((_sigmoid(np.array([-1e4, 0.0, 1e4], np.float32)) >= 0) &
+                  (_sigmoid(np.array([-1e4, 0.0, 1e4], np.float32)) <= 1))),
+      f"{_sigmoid(np.array([-1e4, 0.0, 1e4], np.float32))}")
+check("sigmoid e' monotona crescente",
+      bool(np.all(np.diff(_sigmoid(np.linspace(-8, 8, 65, dtype=np.float32))) > 0)),
+      "")
 
-    # The combined variant has:
-    # attn_qkv = (8192, 2048) → [Q(2048), K(2048), V(2048), extra(2048)]
-    # attn_gate = (4096, 2048) → ??? (could be output or K+V)
-    
-    # Hypothesis 1: Combined uses 3072 for QKV (2048+512+512 with GQA) + 5120 extra
-    # That doesn't add up to 8192.
-    
-    # Hypothesis 2: Combined uses MHA (16 heads, head_dim=128, standard attention)
-    # Q(2048) + K(2048) + V(2048) + gate(2048) = 8192, no GQA
-    # attn_gate(4096, 2048) = K+V combined? or output projection?
-    
-    # Let's just run our forward and see
-    attn = AttentionLayer(
-        hidden_size=HIDDEN,
-        num_heads=N_HEADS,
-        num_kv_heads=N_HEADS,  # MHA in combined variant
-        head_dim=128,
-        kv_head_dim=128,
-        rope_dim=ROPE_DIM,
-        freq_base=FREQ_BASE,
-    )
+print("\n5. GQA: 2 kv-head su 4 query-head, mappa per gruppi")
+# con 4 query-head e 2 kv-head, il gruppo e' 2: teste 0,1 -> kv 0; 2,3 -> kv 1
+SEQ = 5
+kk = rng.standard_normal((SEQ, NKV, HD)).astype(np.float32)
+vv = rng.standard_normal((SEQ, NKV, HD)).astype(np.float32)
+qq = rng.standard_normal((1, NH, HD)).astype(np.float32)
+got = grouped_attention(qq, kk, vv, n_tokens=1, seq_offset=SEQ - 1)
+grp = NH // NKV
+kk2 = np.repeat(kk, grp, axis=1)
+vv2 = np.repeat(vv, grp, axis=1)
+sc = np.einsum("qhd,khd->qhk", qq, kk2) / np.sqrt(HD)
+sc = sc - sc.max(-1, keepdims=True)
+e = np.exp(sc); p = e / e.sum(-1, keepdims=True)
+want = np.einsum("qhk,khd->qhd", p, vv2).reshape(1, NH * HD)
+check("grouped_attention coincide con il broadcasting per gruppi",
+      np.allclose(got, want, atol=1e-6),
+      f"max|d|={float(np.abs(got - want).max()):.2e}")
+# il token all'ultima posizione vede tutti i SEQ token: se la maschera fosse
+# sbagliata qui il confronto sopra fallirebbe, ma vale la pena dirlo
+check("l'ultimo token vede tutti i precedenti (niente mascherati)",
+      np.array_equal(got, grouped_attention(qq, kk, vv, 1, SEQ - 1)), "")
+# e la mappa e' np.repeat, non np.tile come nel delta net
+check("la mappa GQA è np.repeat (h // gruppo)",
+      grp == 2 and np.array_equal(np.repeat(np.arange(2), grp),
+                                  np.array([0, 0, 1, 1])),
+      "teste 0,1 -> kv 0; teste 2,3 -> kv 1")
 
-    out = attn.forward_combined(x, qkv_w, gate_w[:HIDDEN])
-    print(f"  Combined output shape: {out.shape}")
+print("\n6. la maschera causale")
+# con 6 token in cache, il token alla posizione 2 ne vede solo 3: gli altri 3
+# devono essere esclusi, altrimenti il risultato cambierebbe
+S6 = 6
+q1 = rng.standard_normal((1, NH, HD)).astype(np.float32)
+k1 = rng.standard_normal((S6, NKV, HD)).astype(np.float32)
+v1 = rng.standard_normal((S6, NKV, HD)).astype(np.float32)
+o_at2 = grouped_attention(q1, k1, v1, n_tokens=1, seq_offset=2)
+o_see3 = grouped_attention(q1, k1[:3], v1[:3], n_tokens=1, seq_offset=2)
+check("posizione 2 vede solo i primi 3 token",
+      float(np.abs(o_at2 - o_see3).max()) < 1e-6,
+      f"max|d|={float(np.abs(o_at2 - o_see3).max()):.2e}")
+o_at5 = grouped_attention(q1, k1, v1, n_tokens=1, seq_offset=5)
+check("posizione 5 vede tutti e 6 i token",
+      float(np.abs(o_at5 - grouped_attention(q1, k1, v1, 1, 5)).max()) == 0.0,
+      "")
+# e una maschera che non nasconda nulla deve dare lo stesso risultato
+o_no_mask = grouped_attention(q1, k1, v1, n_tokens=1, seq_offset=S6 - 1)
+check("all'ultima posizione la maschera non esclude nulla",
+      float(np.abs(o_no_mask - o_at5).max()) < 1e-6,
+      f"max|d|={float(np.abs(o_no_mask - o_at5).max()):.2e}")
 
-    # NumPy reference
-    b, s, _ = x.shape
-    qkv = x @ qkv_w.T  # (b, s, 8192)
-    q, k, v, gate = np.split(qkv, 4, axis=-1)
+print("\n7. il decode token per token con la cache")
+layer.init_cache(max_seq_len=32)
+seq = rng.standard_normal((4, HIDDEN)).astype(np.float32)
+outs_inc = []
+for t in range(4):
+    outs_inc.append(layer.forward(seq[t:t + 1], w, cache=layer.cache))
+inc = np.concatenate(outs_inc, axis=0)
 
-    rope = RoPE(head_dim=128, rope_dim=64, freq_base=FREQ_BASE)
-    q_r = rope.apply_rotary(q.reshape(b, s, N_HEADS, 128).transpose(0, 2, 1, 3))
-    k_r = rope.apply_rotary(k.reshape(b, s, N_HEADS, 128).transpose(0, 2, 1, 3))
-    v_r = v.reshape(b, s, N_HEADS, 128).transpose(0, 2, 1, 3)
+layer.reset_cache()
+full = layer.forward(seq, w, cache=layer.cache)
+rel = float(np.abs(inc - full).max() / np.abs(full).max())
+check("token per token == sequenza intera", rel < 1e-5,
+      f"rel={rel:.2e}, seq_len={layer.cache.length}")
 
-    scale = 1.0 / np.sqrt(128)
-    scores = np.einsum("bhqd,bhkd->bhqk", q_r, k_r) * scale
-    mask = np.triu(np.ones((s, s), dtype=bool), k=1)
-    scores = np.where(mask, -1e9, scores)
-    scores = numpy_softmax(scores, axis=-1)
-    attn_ref = np.einsum("bhqk,bhkd->bhqd", scores, v_r)
-    b, h, s2, d = attn_ref.shape
-    attn_ref = attn_ref.transpose(0, 2, 1, 3).reshape(b, s2, h * d)
+print("\n8. la cache cresce e si svuota")
+layer.reset_cache()
+check("reset azzera la cache", layer.cache.length == 0, "")
+layer.forward(seq, w, cache=layer.cache)
+check("la cache contiene tutti i token",
+      layer.cache.length == 4 and layer.cache.keys.shape == (4, NKV, HD),
+      f"keys={layer.cache.keys.shape}")
+try:
+    layer.init_cache(max_seq_len=2)
+    layer.forward(rng.standard_normal((4, HIDDEN)).astype(np.float32), w,
+                  cache=layer.cache)
+    check("cache troppo piccola viene rifiutata", False, "accettata")
+except ValueError as err:
+    check("cache troppo piccola viene rifiutata", True, str(err)[:40])
 
-    gate_act = gate * (1.0 / (1.0 + np.exp(-gate)))
-    attn_ref = attn_ref * gate_act
-    ref = (attn_ref @ gate_w[:HIDDEN].T)
+print("\n9. le forme dei pesi sono verificate all'ingresso")
+try:
+    layer.prepare_weights(
+        rng.standard_normal((HIDDEN, NH * HD)).astype(np.float32),
+        rng.standard_normal((HIDDEN, NKV * HD)).astype(np.float32),
+        rng.standard_normal((HIDDEN, NKV * HD)).astype(np.float32),
+        rng.standard_normal(HD).astype(np.float32),
+        rng.standard_normal(HD).astype(np.float32),
+        rng.standard_normal((NH * HD, HIDDEN)).astype(np.float32))
+    check("attn_q senza il gate viene rifiutata", False, "accettata")
+except ValueError as err:
+    check("attn_q senza il gate viene rifiutata", True,
+          "manca il fattore 2 del gate")
+try:
+    # Su questo layer HIDDEN (12) e' uguale a NH*HD (4*3): la forma
+    # "trasposta" coinciderebbe con quella giusta e il controllo passerebbe
+    # sempre, senza dire niente. Serve un layer con hidden != NH*HD: e'
+    # esattamente il caso che il docstring di questo file dichiara
+    # non verificabile con forme quadrate.
+    HIDDEN2 = NH * HD + 5
+    layer2 = AttentionLayer(hidden_size=HIDDEN2, num_heads=NH, num_kv_heads=NKV,
+                            head_dim=HD, rope_dim=ROPE_D, freq_base=10000.0,
+                            eps=EPS)
+    assert HIDDEN2 != NH * HD, "il test perde senso"
+    layer2.prepare_weights(
+        rng.standard_normal((HIDDEN2, NH * 2 * HD)).astype(np.float32),
+        rng.standard_normal((HIDDEN2, NKV * HD)).astype(np.float32),
+        rng.standard_normal((HIDDEN2, NKV * HD)).astype(np.float32),
+        rng.standard_normal(HD).astype(np.float32),
+        rng.standard_normal(HD).astype(np.float32),
+        rng.standard_normal((HIDDEN2, NH * HD)).astype(np.float32))  # inverso!
+    check("attn_output trasposto viene rifiutato", False,
+          f"accettato: ({HIDDEN2}, {NH * HD}) invece di ({NH * HD}, {HIDDEN2})")
+except ValueError:
+    check("attn_output trasposto viene rifiutato", True,
+          "(hidden, n_head*head_dim) non e' accettata")
 
-    diff = np.abs(out.astype(np.float64) - ref).max()
-    scale_val = float(np.abs(ref).max())
-    rel = diff / max(scale_val, 1e-9)
-    corr = float(np.corrcoef(out.astype(np.float64).flatten(), ref.flatten())[0, 1])
-
-    check("combined attention matches NumPy reference",
-          rel < 5e-3 and corr > 0.999,
-          f"rel={rel:.3e}, corr={corr:.6f}")
-
-    # =====================================================================
-    # Test 2: Split Q/K/V with QK-norm (layer 3, Q4_K)
-    print("\n--- Split Q/K/V with QK-norm (layer 3, Q4_K/Q6_K/Q4_K) ---")
-    layer = 3
-
-    q_t = tmap["blk.3.attn_q.weight"]
-    k_t = tmap["blk.3.attn_k.weight"]
-    v_t = tmap["blk.3.attn_v.weight"]
-    out_t = tmap["blk.3.attn_output.weight"]
-    qn_t = tmap["blk.3.attn_q_norm.weight"]
-    kn_t = tmap["blk.3.attn_k_norm.weight"]
-
-    q_w = get_weight(q_t).reshape(8192, 2048)
-    k_w = get_weight(k_t).reshape(512, 2048)
-    v_w = get_weight(v_t).reshape(512, 2048)
-    out_w = get_weight(out_t).reshape(2048, 4096)
-    qn_w = np.frombuffer(qn_t.data, dtype=np.float32).copy()
-    kn_w = np.frombuffer(kn_t.data, dtype=np.float32).copy()
-
-    print(f"  Q: {q_w.shape}, K: {k_w.shape}, V: {v_w.shape}")
-    print(f"  Out: {out_w.shape}, Q-norm: {qn_w.shape}, K-norm: {kn_w.shape}")
-    print(f"  Q head_dim=512 (16*512=8192), K/V head_dim=256 (2*256=512)")
-
-    # In this variant:
-    # Q = (8192, 2048) → 16 heads × 512 head_dim
-    # K = (512, 2048)  → 2 kv_heads × 256 head_dim  
-    # V = (512, 2048)  → 2 kv_heads × 256 head_dim
-    # QK-norm: (256,) → normalizes first 256 dims of Q? Or 512-dim Q to 256?
-    # 
-    # QK-norm typically normalizes the Q and K projections to unit norm per head
-    # weight (256,) with Q having head_dim 512 means only 256 are used for attention
-    # OR: QK-norm is applied to the 256-dim and Q is split into 2 parts: 256 for
-    # attention + 256 for something else (like a gate)
-
-    # Let's check: output is (2048, 4096) = (hidden, 2*hidden)
-    # So after attention, we get hidden-dim output, expanded to 2*hidden
-    # This doesn't match standard attention output which should be (hidden, hidden)
-
-    # Maybe: attention output is 4096 = 8 * 512 = 8 groups * 512?
-    # Or: 16 heads * 256 = 4096, so attention dim is 256, not head_dim
-    
-    # This is a complex variant. Let's just verify shapes and basic correctness.
-    q_norm = RMSNorm(qn_w)
-    k_norm = RMSNorm(kn_w)
-
-    # The QK-norm has 256 elements. If Q head_dim is 512, maybe the norm applies
-    # to a 256-dim subspace. But the attention output weight takes 4096 input.
-    
-    # Actually, 4096 = 16 * 256, so maybe attention works on 256-dim
-    # after QK-norm reduces Q from 512 to 256
-    
-    check("split attention Q weight shape correct", q_w.shape == (8192, 2048))
-    check("split attention K weight shape correct", k_w.shape == (512, 2048))
-    check("split attention V weight shape correct", v_w.shape == (512, 2048))
-    check("split attention output shape correct", out_w.shape == (2048, 4096))
-    check("split attention QK-norm present", len(qn_w) == 256 and len(kn_w) == 256)
-
-    # =====================================================================
-    # Test 3: Verify attention with KV cache
-    print("\n--- KV cache test ---")
-    from flash_moe.attention import KVCache
-    cache = KVCache(num_kv_heads=2, head_dim=256, max_seq_len=32)
-    cache.allocate()
-    # KV cache expects shape (seq, kv_heads, head_dim) → pass (1, 2, 256) for a single token
-    k_test = np.random.randn(1, 2, 256).astype(np.float32)  # (seq, kv_heads, head_dim)
-    v_test = np.random.randn(1, 2, 256).astype(np.float32)
-    cache.append(k_test, v_test)
-    print(f"  Cache seq_len after append: {cache.seq_len}")
-    check("KV cache grows correctly", cache.seq_len == 1)
-
-    print("\n" + "=" * 78)
-    print(f" PASSED: {len(PASSED)}   FAILED: {len(FAILED)}")
-    for name, detail in FAILED:
-        print(f"   - {name}: {detail}")
-    return 0 if not FAILED else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+print(f"\n{'=' * 66}\n PASSATI: {ok}   FALLITI: {bad}\n{'=' * 66}")
+sys.exit(1 if bad else 0)
