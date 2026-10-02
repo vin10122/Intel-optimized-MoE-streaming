@@ -164,6 +164,11 @@ class GatedDeltaNetLayer:
         # l'allocatore, che per 32 teste su 30 layer sarebbe 960 allocazioni
         # di 64 KiB per token.
         self._kv_buf = np.zeros(head_v_dim, dtype=np.float32)
+        # Lo stesso per la replica di q e k: con n_v_heads > n_k_heads la
+        # copia e' di 32x128 float32 = 16 KiB per variabile, e senza buffer
+        # l'allocatore verrebbe chiamato 60 volte per token.
+        self._q_rep = np.zeros((n_v_heads, head_k_dim), dtype=np.float32)
+        self._k_rep = np.zeros((n_v_heads, head_k_dim), dtype=np.float32)
 
     def reset(self) -> None:
         self.state.fill(0.0)
@@ -274,12 +279,37 @@ class GatedDeltaNetLayer:
         q = _l2_normalize(q) / np.sqrt(self.head_k_dim)
         k = _l2_normalize(k)
 
-        # n_v_heads (32) e' multiplo di n_k_heads (16): le chiavi sono
-        # replicate per allineare alle teste di valore, come in llama.cpp.
+        # n_v_heads (32) e' multiplo di n_k_heads (16): q e k vanno replicati
+        # per allinearli alle 32 teste di valore.
+        #
+        # Il pattern NON e' np.repeat. In llama.cpp la replica e' un
+        # ggml_repeat_4d, la cui CPU implementation (ggml-cpu/ops.cpp,
+        # ggml_compute_forward_repeat_f32) scrive la testa di destinazione
+        # all'indice ``i1*ne01 + k1``, con k1 che corre su ne01 = n_k_heads:
+        # quindi la testa di valore h prende la chiave h % n_k_heads, cioe'
+        #
+        #     testa 0,1,2,3 -> chiave 0,1,0,1
+        #
+        # np.repeat darebbe h // n_k_heads, cioe' 0,0,1,1: e' il pattern di
+        # Qwen3-Next, non quello di Qwen3.5. La differenza non e' un
+        # dettaglio, porta a un errore del 53% sull'output del layer, e i
+        # test numerici non la colgono perche' entrambe le versioni
+        # producono numeri plausibili. Vedi
+        # tools/test_gated_deltanet_replication.py.
         reps = self.n_v_heads // self.n_k_heads
         if reps > 1:
-            k = np.repeat(k, reps, axis=0)
-            q = np.repeat(q, reps, axis=0)
+            # Il tiling si scrive come una copia di (reps, n_k_heads) da
+            # (1, n_k_heads): e' esattamente h % n_k_heads per qualunque
+            # rapporto. L'ordine dei due assi e' essenziale: con
+            # (n_k_heads, reps) la copia darebbe ogni chiave ripetuta di
+            # seguito, che e' proprio np.repeat, cioe' l'errore che questo
+            # test esiste per prevenire. copyto evita l'allocazione.
+            self._q_rep.reshape(reps, self.n_k_heads,
+                                self.head_k_dim)[:] = q[None, :, :]
+            self._k_rep.reshape(reps, self.n_k_heads,
+                                self.head_k_dim)[:] = k[None, :, :]
+            q = self._q_rep
+            k = self._k_rep
 
         # _delta_step modifica lo stato in place, quindi va chiamata una volta
         # sola per testa: chiamarla due volte applicherebbe il delta rule due

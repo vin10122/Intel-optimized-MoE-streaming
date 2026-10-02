@@ -179,7 +179,10 @@ def ref_step(x, state, conv, transpose=False):
     k = _l2_normalize(c[key_dim:2*key_dim].reshape(N_K, D_K))
     vv = c[2*key_dim:].reshape(N_V, D_V)
     reps = N_V // N_K
-    k = np.repeat(k, reps, axis=0); q = np.repeat(q, reps, axis=0)
+    # Pattern di Qwen3.5: la testa di valore h prende la chiave
+    # h % n_k_heads, non h // n_k_heads come darebbe np.repeat. Vedi
+    # test_gated_deltanet_replication.py.
+    k = np.tile(k, (reps, 1)); q = np.tile(q, (reps, 1))
     outs = []
     for h in range(N_V):
         S = state[h]
