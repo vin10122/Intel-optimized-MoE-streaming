@@ -111,7 +111,7 @@ class GatedDeltaNetLayer:
     def __init__(self, layer_idx: int, weights: dict[str, np.ndarray],
                  hidden_size: int, n_v_heads: int, n_k_heads: int,
                  head_k_dim: int, head_v_dim: int, conv_kernel: int,
-                 eps: float = 1e-6) -> None:
+                 eps: float = 1e-6, keep_f32: bool = False) -> None:
         self.layer_idx = layer_idx
         self.w = weights
         self.hidden_size = hidden_size
@@ -128,24 +128,36 @@ class GatedDeltaNetLayer:
         # I pesi si tengono in f16 (vincolo di memoria sul modello) ma si
         # calcola in f32: la conversione f16 -> f32 di tutti i pesi di un
         # layer costa 52 ms, contro 1.6 ms dei matmul veri. Rifarla a ogni
-        # token rendeva due terzi del forward puro spreco, quindi qui si
-        # converte una volta sola e si riusa la copia f32.
+        # token rendeva due terzi del forward puro spreco.
         #
-        # Costo: la copia f32 di un layer e' 128.6 MiB (33.7M elementi da 4
-        # byte) piu' i 64.3 MiB dei f16 originali, che restano referenziati
-        # da self.w. Per i 30 layer SSM tenuti tutti vivi in f32 servirebbero
-        # 5.65 GiB, quindi i layer vanno costruiti su richiesta e rilasciati,
-        # non tutti insieme. Il guadagno (52 ms/token per layer) e' molto
-        # piu' grande del costo, ma e' un trade-off, non un free lunch.
-        self.w32 = {k: np.ascontiguousarray(v, dtype=np.float32)
-                    for k, v in weights.items()}
+        # keep_f32=True tiene la copia per sempre: e' la scelta veloce (52 ms
+        # per layer risparmiati a ogni token) ma costa 128.6 MiB per layer,
+        # quindi 3.75 GiB se i 30 layer sono vivi tutti insieme. Con 6 GiB
+        # liberi e 0.95 GiB per embedding e 0.95 per la LM head non ci sta:
+        # la copia si puo' tenere per un singolo layer (per misurare il
+        # guadagno) o per un gruppo piccolo, non per tutti e 30.
+        #
+        # Con keep_f32=False i pesi restano f16 e vengono convertiti a ogni
+        # passo. E' il percorso lento ma e' l'unico che entra in memoria, e il
+        # suo costo e' il debito di velocita' da pagare: finche' non e'
+        # risolto, il tempo del forward e' dominato dalla conversione e non
+        # dal calcolo.
+        self.keep_f32 = keep_f32
+        # I pesi grandi sono tre: qkv (2048x8192), gate (2048x4096) e out
+        # (4096x2048). Gli altri valgono 0.2M elementi, quindi la loro copia
+        # f32 costa meno di un MiB e si tiene per sempre in ogni caso.
+        self._big = ("qkv", "gate", "out")
+        self.small = {k: np.ascontiguousarray(v, dtype=np.float32)
+                      for k, v in weights.items() if k not in self._big}
+        self.big32 = ({k: np.ascontiguousarray(weights[k], dtype=np.float32)
+                       for k in self._big} if keep_f32 else None)
 
         # ssm_conv1d e' (conv_kernel, conv_dim) nel GGUF: l'asse veloce e' il
         # canale, quindi per il prodotto scalare per canale serve il
         # trasposto, di forma (conv_dim, conv_kernel). Il trasposto e' fatto
         # una volta sola qui, non a ogni token.
         self.conv_kernel_w = np.ascontiguousarray(
-            self.w32["conv1d"].reshape(conv_kernel, self.conv_dim).T)
+            self.small["conv1d"].reshape(conv_kernel, self.conv_dim).T)
 
         # Stato in f32: la ricorrenza accumula su se stessa per tutta la
         # sequenza, e in f16 perderebbe il decadimento exp(gate) che si
@@ -170,9 +182,36 @@ class GatedDeltaNetLayer:
         self._q_rep = np.zeros((n_v_heads, head_k_dim), dtype=np.float32)
         self._k_rep = np.zeros((n_v_heads, head_k_dim), dtype=np.float32)
 
+    def promote_to_f32(self) -> None:
+        """ Tiene la copia f32 dei pesi grandi per sempre.
+
+        Si chiama dopo la costruzione, quando si e' deciso che la memoria
+        c'e': costruire il layer gia' con keep_f32=True farebbe la copia
+        mentre gli altri layer sono ancora in costruzione, cioe' nel momento
+        in cui il picco di memoria e' peggiore. Costa 128.6 MiB per layer.
+        """
+        if self.big32 is not None:
+            return
+        self.big32 = {k: np.ascontiguousarray(self.w[k], dtype=np.float32)
+                      for k in self._big}
+        self.keep_f32 = True
+
     def reset(self) -> None:
         self.state.fill(0.0)
         self.conv_state.fill(0.0)
+
+    def f32(self, name: str) -> np.ndarray:
+        """Il peso ``name`` in f32, convertito ora se non e' tenuto in copia.
+
+        La copia permanente esiste solo con ``keep_f32``; altrimenti si
+        converte qui e si lascia che l'allocatore la liberi a fine passo. Il
+        costo e' quello che rende lento il percorso senza copia, ed e'
+        voluto esplicitamente invece che nascosto dietro un default veloce
+        che non entra in memoria.
+        """
+        if self.big32 is not None and name in self.big32:
+            return self.big32[name]
+        return np.asarray(self.w[name], dtype=np.float32)
 
     # ------------------------------------------------------------------ passi
 
@@ -188,13 +227,14 @@ class GatedDeltaNetLayer:
 
         Si usa ``self.w32``, la copia f32 fatta una volta alla costruzione,
         non ``self.w``: riconvertire i pesi a ogni token costerebbe piu' di
-        tutti i matmul messi insieme.
+        tutti i matmul messi insieme. Quando la copia non e' tenuta
+        (``keep_f32=False``) la conversione avviene qui, e questa e' la voce
+        che domina il tempo del forward.
         """
-        w32 = self.w32
-        qkv = x @ w32["qkv"]
-        z = x @ w32["gate"]
-        beta = _sigmoid(x @ w32["beta"])
-        alpha = x @ w32["alpha"]
+        qkv = x @ self.f32("qkv")
+        z = x @ self.f32("gate")
+        beta = _sigmoid(x @ self.small["beta"])
+        alpha = x @ self.small["alpha"]
         return qkv, z, beta, alpha
 
     def _conv(self, qkv: np.ndarray) -> np.ndarray:
@@ -262,7 +302,7 @@ class GatedDeltaNetLayer:
 
         # gate: ssm_a contiene gia' -exp(A_log), quindi basta il softplus
         # moltiplicato, non un exp in piu'.
-        gate = _softplus(alpha + self.w32["dt_bias"]) * self.w32["a"]
+        gate = _softplus(alpha + self.small["dt_bias"]) * self.small["a"]
 
         conv_out = self._conv(qkv)
         key_dim = self.head_k_dim * self.n_k_heads
@@ -322,7 +362,7 @@ class GatedDeltaNetLayer:
 
         # gated RMSNorm: rmsnorm(out) * silu(z), z alla forma dei value-head.
         z = z.reshape(self.n_v_heads, self.head_v_dim)
-        norm_w = self.w32["norm"]
+        norm_w = self.small["norm"]
         eps = 1e-6
         rms = head_out * (1.0 / np.sqrt(
             np.mean(head_out * head_out, axis=-1, keepdims=True) + eps))
@@ -333,7 +373,7 @@ class GatedDeltaNetLayer:
         # cioe' con l'asse di uscita per secondo, al contrario di attn_qkv e
         # attn_gate che sono (n_embd, ...). Qui il verso e' proprio quello
         # della memorizzazione: flat (value_dim) @ out -> n_embd.
-        return flat @ self.w32["out"]
+        return flat @ self.f32("out")
 
 
 def is_recurrent_layer(tensor_map: dict, layer: int) -> bool:

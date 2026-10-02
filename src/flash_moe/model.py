@@ -16,6 +16,7 @@ from .router import ExpertRouter, routers_from_gguf
 from .shared_expert import SharedExpert
 from .embedding import EmbeddingLookup, LMHead, sample
 from .transformer import TransformerBlock
+from .gated_deltanet import GatedDeltaNetLayer, is_recurrent_layer, load_layer_weights
 
 import gguf
 
@@ -38,11 +39,13 @@ class Qwen3MoEModel:
         max_seq_len: int = 2048,
         cache_capacity: int = 700,
         dequant_fn: Any = None,
+        keep_ssm_f32: bool = False,
     ) -> None:
         self.gguv_path = gguf_path
         self.device = device
         self.max_seq_len = max_seq_len
         self.cache_capacity = cache_capacity
+        self._dequant_fn = dequant_fn
 
         reader = gguf.GGUFReader(gguf_path)
         self.tmap = {t.name: t for t in reader.tensors}
@@ -71,6 +74,37 @@ class Qwen3MoEModel:
 
         self.bos_token_id = int(reader.fields["tokenizer.ggml.bos_token_id"].parts[-1][0])
         self.eos_token_id = int(reader.fields["tokenizer.ggml.eos_token_id"].parts[-1][0])
+
+        # I layer ricorrenti hanno i propri iperparametri. Nei metadati ci sono
+        # ssm.group_count (= le key-head), ssm.time_step_rank (= le value-head)
+        # e ssm.inner_size (= value_dim): le dimensioni delle singole teste non
+        # ci sono, e hidden/num_heads non le dà. Quelle si ricavano dalle forme
+        # dei tensori del blocco, che sono l'unica fonte autorevole:
+        #   attn_qkv.weight = (hidden, conv_dim)   con conv_dim = key_dim*2 + value_dim
+        #   attn_gate.weight = (hidden, value_dim)
+        #   ssm_norm.weight = head_k_dim (il norm e' sulla dimensione delle chiavi)
+        # Ogni ricostruzione viene controllata contro la forma che il GGUF
+        # dichiara, cosi' un modello con proporzioni diverse fallisce qui e non a
+        # metà del forward.
+        self.ssm_group = int(reader.fields[f"{arch}.ssm.group_count"].parts[-1][0])
+        self.ssm_tsr = int(reader.fields[f"{arch}.ssm.time_step_rank"].parts[-1][0])
+        self.ssm_inner = int(reader.fields[f"{arch}.ssm.inner_size"].parts[-1][0])
+        self.ssm_conv_kernel = int(reader.fields[f"{arch}.ssm.conv_kernel"].parts[-1][0])
+        self.ssm_n_k = self.ssm_group
+        self.ssm_n_v = self.ssm_tsr
+        self.ssm_d_v = self.ssm_inner // self.ssm_n_v
+        # head_k_dim viene dal norm: se manca, si ricava da key_dim e n_k_heads,
+        # che pero' richiede la forma di attn_qkv, quindi si rimanda a _build_ssm.
+        self.ssm_d_k = int(self.tmap["blk.0.ssm_norm.weight"].n_elements)
+        if self.ssm_n_v % self.ssm_n_k != 0:
+            raise ValueError(
+                f"n_v_heads ({self.ssm_n_v}) deve essere multiplo di "
+                f"n_k_heads ({self.ssm_n_k}): le chiavi si replicano sulle "
+                "teste di valore")
+        if self.ssm_inner != self.ssm_d_v * self.ssm_n_v:
+            raise ValueError(
+                f"ssm.inner_size ({self.ssm_inner}) incoerente con "
+                f"n_v_heads ({self.ssm_n_v}) e head_v_dim ({self.ssm_d_v})")
 
         self.tensor_types = self._build_tensor_types()
 
@@ -129,9 +163,89 @@ class Qwen3MoEModel:
 
         # Build transformer blocks
         self.blocks: list[TransformerBlock] = []
+        # I 30 layer ricorrenti non stanno in self.blocks: hanno le norme e il
+        # ramo MoE dello stesso blocco, ma al posto dell'attenzione c'e' il
+        # delta net, che vive qui. Attn_qkv e attn_gate di un layer SSM sono le
+        # proiezioni del delta net, quindi non vanno tenuti anche nel blocco:
+        # tenere entrambe le copie costava 1,4 GiB.
+        self.ssm: dict[int, GatedDeltaNetLayer] = {}
         for layer in range(self.block_count):
-            block = self._build_block(layer)
-            self.blocks.append(block)
+            if is_recurrent_layer(self.tmap, layer):
+                self.ssm[layer] = self._build_ssm(layer)
+            self.blocks.append(self._build_block(layer))
+        # Il blocco di un layer ricorrente riceve il richiamo al delta net:
+        # e' l'unico modo che ha il blocco di sapere cosa mettere al posto
+        # dell'attenzione, senza duplicare la ricorrenza.
+        for layer, lyr in self.ssm.items():
+            self.blocks[layer].ssm_runner = (
+                lambda x, _lyr=lyr: self._run_ssm(_lyr, x))
+        self.ssm_keep_f32 = keep_ssm_f32
+        # Il percorso veloce tiene la copia f32 dei pesi del delta net. Sono
+        # 128.6 MiB per layer, quindi 3.75 GiB per i 30 layer: si accende solo
+        # se la memoria c'e', e va misurato il guadagno prima di renderlo il
+        # default, perche' il prezzo e' il rischio di non entrare in RAM.
+        if keep_ssm_f32:
+            for lyr in self.ssm.values():
+                lyr.promote_to_f32()
+
+    def _build_ssm(self, layer: int) -> GatedDeltaNetLayer:
+        """Costruisce il Gated DeltaNet di un layer ricorrente.
+
+        Le forme dei tensori vengono controllate contro le dimensioni ricavate
+        dai metadati. key_dim non e' nei metadati: esce da
+        conv_dim = key_dim * 2 + value_dim, dove conv_dim e' la seconda
+        dimensione di attn_qkv.weight. Su questo modello conv_dim 8192 e
+        value_dim 4096 danno key_dim 2048, e 2048 con 16 key-head da 128
+        combacia con ssm_norm (128).
+        """
+        qkv_shape = tuple(int(v) for v in self.tmap[f"blk.{layer}.attn_qkv.weight"].shape)
+        gate_shape = tuple(int(v) for v in self.tmap[f"blk.{layer}.attn_gate.weight"].shape)
+        out_shape = tuple(int(v) for v in self.tmap[f"blk.{layer}.ssm_out.weight"].shape)
+        norm_n = int(self.tmap[f"blk.{layer}.ssm_norm.weight"].n_elements)
+
+        # Attenzione alle convenzioni: _get_tensor e load_layer_weights
+        # restituiscono (out, in), cioe' l'asse 0 e' l'uscita. value_dim e' la
+        # dimensione dei value-head ed e' la seconda dimensione di attn_gate.
+        value_dim = gate_shape[1]
+        if value_dim != self.ssm_inner:
+            raise ValueError(
+                f"blk.{layer}.attn_gate.weight ha {value_dim} colonne, attese "
+                f"{self.ssm_inner} = ssm.inner_size")
+        if out_shape[0] != value_dim or out_shape[1] != self.hidden_size:
+            raise ValueError(
+                f"blk.{layer}.ssm_out.weight di forma {out_shape}, attesa "
+                f"{(value_dim, self.hidden_size)}: e' l'unico peso SSM con "
+                "l'asse di uscita per secondo")
+        conv_dim = qkv_shape[1]
+        if (conv_dim - value_dim) % 2 != 0:
+            raise ValueError(
+                f"blk.{layer}.attn_qkv.weight ha {conv_dim} colonne: "
+                f"conv_dim - value_dim = {conv_dim - value_dim} non e' pari, "
+                "ma conv_dim = key_dim * 2 + value_dim lo richiede")
+        key_dim = (conv_dim - value_dim) // 2
+        head_k_dim = norm_n
+        if key_dim % self.ssm_n_k != 0:
+            raise ValueError(
+                f"key_dim ({key_dim}) non divisibile per n_k_heads "
+                f"({self.ssm_n_k})")
+        if key_dim // self.ssm_n_k != head_k_dim:
+            raise ValueError(
+                f"key_dim ({key_dim}) con {self.ssm_n_k} key-head da "
+                f"{head_k_dim} fa {key_dim // self.ssm_n_k}, non {head_k_dim}: "
+                "head_k_dim non combacia")
+
+        weights = load_layer_weights(self.tmap, layer, self._dequant_fn)
+        return GatedDeltaNetLayer(
+            layer_idx=layer,
+            hidden_size=self.hidden_size,
+            n_v_heads=self.ssm_n_v,
+            n_k_heads=self.ssm_n_k,
+            head_k_dim=head_k_dim,
+            head_v_dim=self.ssm_d_v,
+            conv_kernel=self.ssm_conv_kernel,
+            weights=weights,
+            eps=self.eps,
+        )
 
     def _build_tensor_types(self) -> dict[int, dict[str, int]]:
         """Reads ggml types per-layer for expert tensors (gate/up/down)."""
@@ -179,30 +293,31 @@ class Qwen3MoEModel:
         else:
             post_attn_norm_w = np.ones(self.hidden_size, dtype=np.float16)
 
-        is_combined = f"blk.{layer}.attn_qkv.weight" in self.tmap
+        is_ssm = is_recurrent_layer(self.tmap, layer)
 
-        if is_combined:
-            qkv_w = self._get_tensor(f"blk.{layer}.attn_qkv.weight")
-            gate_w = self._get_tensor(f"blk.{layer}.attn_gate.weight")
+        if is_ssm:
+            # Nessuna proiezione di attenzione: su questo layer i tensori
+            # attn_qkv e attn_gate sono le proiezioni del delta net e sono
+            # gia' caricate dentro GatedDeltaNetLayer. Qui restano solo le
+            # norme e il ramo MoE, che sono identici nei due tipi di layer.
             return TransformerBlock(
                 layer_idx=layer,
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
-                num_kv_heads=self.num_heads,
-                head_dim=128,
-                kv_head_dim=128,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                kv_head_dim=self.kv_head_dim,
                 rope_dim=self.rope_dim,
                 freq_base=self.freq_base,
                 max_seq_len=self.max_seq_len,
                 attn_norm_weight=attn_norm_w,
                 post_attn_norm_weight=post_attn_norm_w,
-                qkv_weight=qkv_w,
-                attn_gate_weight=gate_w,
                 backend=self.backend,
                 router=self.routers[layer],
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
                 shared_expert=self.shared_expert,
+                is_ssm=True,
             )
         else:
             q_w = self._get_tensor(f"blk.{layer}.attn_q.weight")
@@ -281,9 +396,39 @@ class Qwen3MoEModel:
                 shared_expert=self.shared_expert,
             )
 
+    def _run_ssm(self, layer: GatedDeltaNetLayer, x: np.ndarray) -> np.ndarray:
+        """Applica il delta net a tutta la sequenza, token per token.
+
+        ``GatedDeltaNetLayer.forward`` avanza di un token e restituisce un
+        vettore: la ricorrenza e' sequenziale per definizione, quindi un
+        prefillo di N token non e' un problema di parallelismo ma di corretto
+        ordine. Qui i token si attraversano in ordine e si scrive il risultato
+        nella posizione giusta.
+
+        Il batch e' 1: lo stato del delta net e' uno solo per layer, quindi
+        due sequenze in parallelo si sovrascriverebbero a vicenda lo stato.
+        Accettarlo qui vale piu' che accettarlo in silenzio.
+        """
+        b, s, h = x.shape
+        if b != 1:
+            raise ValueError(
+                f"il delta net ha stato singolo: batch {b} non supportato, "
+                "perche' le due sequenze condividerebbero lo stesso stato")
+        out = np.empty((b, s, h), dtype=np.float32)
+        for si in range(s):
+            out[0, si, :] = layer.forward(x[0, si, :])
+        return out
+
     def init_caches(self) -> None:
         for block in self.blocks:
-            block.init_kv_cache(self.max_seq_len)
+            if not block.is_ssm:
+                block.init_kv_cache(self.max_seq_len)
+        # Lo stato dei layer ricorrenti va azzerato insieme alle cache KV: se
+        # resta com'era dalla generazione precedente, il primo token del nuovo
+        # prompt parte da uno stato che non gli appartiene e l'output e'
+        # sbagliato senza nessun errore.
+        for layer in self.ssm.values():
+            layer.reset()
 
     def forward_layer(
         self,
@@ -312,48 +457,38 @@ class Qwen3MoEModel:
         top_p: float = 0.95,
         seed: int = 42,
     ) -> list[int]:
-        """Autoregressive generation.
+        """Generazione autoregressiva.
 
-        Args:
-            input_ids: List of token IDs for the prompt
-            max_new_tokens: Number of new tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            top_p: Top-p (nucleus) sampling parameter
-            seed: PRNG seed
+        Il prefillo attraversa tutti i token del prompt in un colpo, poi ogni
+        passo ne aggiunge uno. L'offset di posizione non viene passato a mano:
+        ``AttentionLayer.forward`` lo ricava dalla lunghezza della cache, che
+        dopo un prefillo vale il numero di token gia' visti. Passarlo
+        esplicitamente era un doppio libro di conto che poteva anche
+        sbagliare: nel codice precedente il prefillo partiva da
+        ``len(prompt) - 1``, cioe' le posizioni erano gia' sbagliate prima del
+        primo token.
 
         Returns:
-            List of generated token IDs (input + generated)
+            I token generati, prompt compreso.
         """
+        if not input_ids:
+            raise ValueError("input_ids vuoto: niente da cui generare")
         self.init_caches()
         rng = np.random.default_rng(seed)
         generated = list(input_ids)
 
-        for step in range(max_new_tokens):
-            seq_offset = len(generated) - 1
+        # Prefillo: tutto il prompt, in un colpo.
+        x = self.embedding.forward(np.asarray(generated, dtype=np.int64))
+        x = x.reshape(1, len(generated), self.hidden_size)
+        x = self._forward_all(x)
 
-            # Embed last token
-            if step == 0:
-                # Prefill: process entire sequence
-                emb = self.embedding.forward(generated)  # (seq, hidden)
-                x = emb.reshape(1, -1, self.hidden_size)
-            else:
-                # Decode: only last token
-                emb = self.embedding.forward(generated[-1:])  # (1, hidden)
-                x = emb.reshape(1, len(generated[-1:]), self.hidden_size)
+        for _ in range(max_new_tokens):
+            logits = self.output_norm.forward(x)
+            logits = self.lm_head.forward(logits)
+            # (1, seq, vocab) -> solo l'ultima posizione: e' li' che si
+            # campiona. logit[-1] avrebbe restituito tutta la sequenza.
+            last_logits = np.asarray(logits[0, -1], dtype=np.float32).reshape(-1)
 
-            # Forward through all layers
-            for layer_idx in range(self.block_count):
-                x = self.blocks[layer_idx].forward(x, seq_offset=max(0, seq_offset))
-
-            # Output norm + LM head
-            logits = self.output_norm.forward(x)  # (1, seq, hidden)
-            logits = self.lm_head.forward(logits)  # (1, seq, vocab)
-
-            # Get last token logits
-            last_logits = logits[-1] if logits.ndim > 1 else logits
-
-            # Sample
             next_token = sample(
                 last_logits,
                 temperature=temperature,
@@ -362,11 +497,22 @@ class Qwen3MoEModel:
                 rng=rng,
             )
             generated.append(next_token)
-
             if next_token == self.eos_token_id:
                 break
 
+            # Decode: un token alla volta, con lo stato dei layer ricorrenti
+            # e la cache KV gia' avanzati di un passo.
+            x = self.embedding.forward(np.asarray([next_token], dtype=np.int64))
+            x = x.reshape(1, 1, self.hidden_size)
+            x = self._forward_all(x)
+
         return generated
+
+    def _forward_all(self, x: np.ndarray) -> np.ndarray:
+        """Attraversa tutti i 40 layer nell'ordine, ricorrenti e attenzione."""
+        for layer in range(self.block_count):
+            x = self.blocks[layer].forward(x)
+        return x
 
     def close(self) -> None:
         self.store.close()

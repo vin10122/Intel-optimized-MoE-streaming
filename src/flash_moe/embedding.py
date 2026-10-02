@@ -183,7 +183,7 @@ def sample(
 
     Args:
         logits: 1-D array of vocab_size logits.
-        temperature: Softmax temperature (1.0 = no scaling).
+        temperature: Softmax temperature (1.0 = no scaling, 0.0 = greedy).
         top_k: If > 0, keep only the top-k tokens.
         top_p: If > 0, keep smallest set with cumulative prob >= top_p (nucleus).
         rng: Optional PRNG for sampling; deterministic if None.
@@ -194,8 +194,22 @@ def sample(
     if rng is None:
         rng = np.random.default_rng()
 
+    logits = np.asarray(logits, dtype=np.float64)
+
+    # temperature <= 0 vuol dire greedy, non dividere per zero. La divisione
+    # produceva +/-inf, e inf - inf nel softmax e' NaN: il campionamento
+    # falliva con "Probabilities contain NaN" invece di restituire il token
+    # piu' probabile. E' il caso che si usa di piu' per una verifica.
+    if temperature <= 0.0:
+        return int(np.argmax(logits))
+
     if temperature != 1.0:
         logits = logits / temperature
+
+    if not np.all(np.isfinite(logits)):
+        raise ValueError(
+            "logit non finiti: il modello ha prodotto NaN o Inf, e campionare "
+            "su questi valori restituirebbe un token arbitrario senza dire nulla")
 
     sorted_ids = np.argsort(logits)[::-1]
     sorted_logits = logits[sorted_ids]

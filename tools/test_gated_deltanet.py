@@ -145,7 +145,10 @@ layer.reset()
 # qui si usa un input costante e positivo, cosi' alpha ha segno noto e il
 # test non dipende da numeri casuali. Si spegne anche la scrittura con
 # beta ~ 0.
-w = layer.w32
+# a, dt_bias, alpha e beta sono pesi piccoli: la loro copia f32 sta sempre in
+# memoria (meno di un MiB per layer), quindi si possono forzare a valori noti
+# scrivendo dentro quella copia, che e' la stessa che il layer usa a ogni passo.
+w = layer.small
 w["a"][:] = np.float32(-50.0)
 w["dt_bias"][:] = np.float32(0.0)
 w["alpha"][:] = np.float32(1.0)           # x positivo -> alpha > 0

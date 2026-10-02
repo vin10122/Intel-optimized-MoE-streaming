@@ -52,7 +52,7 @@ def main() -> int:
     layer0 = model.blocks[0]
     x = np.random.randn(1, 4, model.hidden_size).astype(np.float32) * 0.01
     normed = layer0.attn_norm.forward(x)
-    check("il layer 0 e' combinato (qkv fused, quindi SSM)", layer0.is_combined, "")
+    check("il layer 0 e' ricorrente (SSM)", layer0.is_ssm, "")
     try:
         layer0._attention_forward(normed, seq_offset=0)
         check("l'attenzione su un layer SSM viene rifiutata", False, "accettata")
@@ -64,7 +64,7 @@ def main() -> int:
     # I layer full attention sono 3, 7, 11, ... (full_attention_interval = 4)
     print("\n--- Layer 3 (full attention) ---")
     layer3 = model.blocks[3]
-    check("il layer 3 e' split (full attention)", not layer3.is_combined, "")
+    check("il layer 3 e' full attention", not layer3.is_ssm, "")
     x3 = np.random.randn(1, 4, model.hidden_size).astype(np.float32) * 0.01
     normed3 = layer3.attn_norm.forward(x3)
     attn_out3 = layer3._attention_forward(normed3, seq_offset=0)
@@ -109,12 +109,78 @@ def main() -> int:
     # =====================================================================
     # L'ordine dei layer: 10 full attention, 30 SSM, ai posti giusti
     print("\n--- mappa dei 40 layer ---")
-    attn_layers = [i for i, b in enumerate(model.blocks) if not b.is_combined]
-    ssm_layers = [i for i, b in enumerate(model.blocks) if b.is_combined]
+    attn_layers = [i for i, b in enumerate(model.blocks) if not b.is_ssm]
+    ssm_layers = [i for i, b in enumerate(model.blocks) if b.is_ssm]
     check("i layer full attention sono 10, ai multipli di 4 meno 1",
           attn_layers == [3, 7, 11, 15, 19, 23, 27, 31, 35, 39],
           f"{attn_layers}")
     check("gli altri 30 sono SSM", len(ssm_layers) == 30, f"{len(ssm_layers)}")
+
+    # =====================================================================
+    # I layer ricorrenti: lo stato e' il punto fragile
+    print("\n--- stato dei layer ricorrenti ---")
+    check("il modello ha costruito 30 delta net", len(model.ssm) == 30,
+          f"{len(model.ssm)}")
+    check("sono gli stessi indici dei blocchi ricorrenti",
+          sorted(model.ssm) == ssm_layers, "")
+
+    lyr = model.ssm[0]
+    check("lo stato ha la forma dichiarata (32 value-head da 128)",
+          lyr.state.shape == (32, 128, 128),
+          f"{tuple(lyr.state.shape)}")
+    check("lo stato parte azzerato",
+          float(np.abs(lyr.state).max()) == 0.0 and
+          float(np.abs(lyr.conv_state).max()) == 0.0, "")
+
+    # Un passo deve sporcare lo stato e la coda: se non lo facesse, azzerare
+    # non significherebbe niente e il test qui sotto passerebbe per il motivo
+    # sbagliato.
+    probe = np.full(model.hidden_size, 0.5, dtype=np.float32)
+    lyr.forward(probe)
+    check("un passo modifica stato e coda",
+          float(np.abs(lyr.state).max()) > 0.0 and
+          float(np.abs(lyr.conv_state).max()) > 0.0,
+          f"stato={float(np.abs(lyr.state).max()):.3e} "
+          f"coda={float(np.abs(lyr.conv_state).max()):.3e}")
+
+    # primo passo da stato pulito
+    lyr.reset()
+    first_clean = lyr.forward(probe).copy()
+    lyr.reset()
+    first_clean2 = lyr.forward(probe).copy()
+    check("reset rende il primo passo riproducibile",
+          np.array_equal(first_clean, first_clean2), "")
+
+    # e il passo successivo NON deve essere uguale al primo: quello stato
+    # azzerato a mano, se non fosse davvero azzerato, si vedrebbe qui.
+    second = lyr.forward(probe).copy()
+    check("il secondo passo continua dallo stato del primo",
+          not np.array_equal(first_clean, second),
+          f"max|d|={float(np.abs(first_clean - second).max()):.3e}")
+
+    # =====================================================================
+    # init_caches deve azzerare anche lo stato SSM, non solo le cache KV
+    print("\n--- init_caches azzera tutto ---")
+    model.init_caches()
+    check("init_caches azzera lo stato di tutti i 30 layer SSM",
+          all(float(np.abs(l.state).max()) == 0.0 and
+              float(np.abs(l.conv_state).max()) == 0.0
+              for l in model.ssm.values()), "")
+    check("init_caches crea la cache KV solo sui 10 layer di attenzione",
+          all(b.kv_cache is not None for b in model.blocks if not b.is_ssm) and
+          all(b.kv_cache is None for b in model.blocks if b.is_ssm),
+          "")
+
+    # Due esecuzioni dopo init_caches devono dare lo stesso risultato: se lo
+    # stato non fosse azzerato, la seconda partirebbe da uno stato sporco e i
+    # due output divergerebbero senza nessun errore.
+    model.init_caches()
+    xs = np.random.randn(1, 2, model.hidden_size).astype(np.float32) * 0.01
+    o_a = model.forward_layer(0, xs)
+    model.init_caches()
+    o_b = model.forward_layer(0, xs)
+    check("due esecuzioni dopo init_caches coincidono",
+          np.array_equal(o_a, o_b), "")
 
     model.close()
 

@@ -48,13 +48,26 @@ class TransformerBlock:
         intermediate_size: int = 512,
         num_experts: int = 256,
         shared_expert: Any = None,
+        is_ssm: bool = False,
+        ssm_runner: Any = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_experts = num_experts
 
-        self.is_combined = qkv_weight is not None
+        # Su questo modello is_ssm NON si deduce da qkv_weight: i tensori
+        # attn_qkv e attn_gate esistono anche sui layer ricorrenti, dove sono
+        # le proiezioni del Gated DeltaNet, non di un'attenzione. Dedurlo dalla
+        # presenza del peso e' quello che faceva prima, e insieme alla doppia
+        # copia dei pesi (una qui, una nel layer SSM) costava 1,4 GiB.
+        # Arriva esplicito dal modello, che sa come e' fatto il layer.
+        self.is_ssm = is_ssm
+        # Sul layer ricorrente il "mixed" non e' un tipo diverso di blocco: e'
+        # lo stesso blocco con la ricorrenza al posto dell'attenzione. Il
+        # richiamo e' iniettato dal modello, che possiede il delta net e il suo
+        # stato, cosi' il blocco non deve sapere nulla dei tensori ssm_*.
+        self.ssm_runner = ssm_runner
         self.qkv_weight = qkv_weight
         self.attn_gate_weight = attn_gate_weight
         self.q_weight = q_weight
@@ -62,11 +75,8 @@ class TransformerBlock:
         self.v_weight = v_weight
         self.attn_output_weight = attn_output_weight
 
-        # Separate RoPE for attention heads
-        # Combined variant: 128-dim heads, split variant: 256-dim heads
-        attn_head_dim = 128 if self.is_combined else 256
         self.rope = RoPE(
-            head_dim=attn_head_dim,
+            head_dim=head_dim,
             rope_dim=rope_dim,
             freq_base=freq_base,
             max_seq_len=max_seq_len,
@@ -134,7 +144,7 @@ class TransformerBlock:
         copie di un calcolo che si sbaglia in modi diversi sono la peggio
         combinazione possibile.
         """
-        if self.is_combined:
+        if self.is_ssm:
             raise TypeError(
                 f"blk.{self.layer_idx} e' un layer SSM (Gated DeltaNet): "
                 "l'attenzione non si esegue su questo blocco, vedi "
@@ -189,10 +199,22 @@ class TransformerBlock:
             seq_offset: Position in KV cache for autoregressive decoding
             moe_activation: Optional pre-computed activation for the MoE layer
         """
-        # 1. Self-attention
+        # 1. Ricorrenza o attenzione, secondo il tipo di layer.
+        #
+        # attn_norm si applica in entrambi i casi: su un layer ricorrente non e'
+        # un nome infelice, e' la stessa norma che llama.cpp chiama
+        # attention_norm anche quando al posto dell'attenzione c'e' il delta
+        # net (src/models/qwen3next.cpp, ramo build_layer_attn_linear).
         normed = self.attn_norm.forward(x)
-        attn_out = self._attention_forward(normed, seq_offset)
-        h = x + attn_out  # residual
+        if self.is_ssm:
+            if self.ssm_runner is None:
+                raise TypeError(
+                    f"blk.{self.layer_idx} e' un layer ricorrente ma non ha un "
+                    "ssm_runner: il delta net va iniettato dal modello")
+            mixed = self.ssm_runner(normed)
+        else:
+            mixed = self._attention_forward(normed, seq_offset)
+        h = x + mixed  # residual
 
         # 2. MoE feed-forward
         normed2 = self.post_attn_norm.forward(h)
