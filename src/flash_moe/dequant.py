@@ -160,9 +160,22 @@ def dequantize_to(raw: bytes | bytearray | np.ndarray, ggml_type: int,
     for start in range(0, n_blocks, blocks_per_chunk):
         count = min(blocks_per_chunk, n_blocks - start)
         chunk = data[start * bytes_per_block:(start + count) * bytes_per_block]
-        piece = gguf.quants.dequantize(chunk, ggml_type)
-        out[written:written + count * block_size] = piece.astype(np.float16)
-        written += count * block_size
+        piece = np.asarray(gguf.quants.dequantize(chunk, ggml_type),
+                           dtype=np.float16).reshape(-1)
+        # Il reshape serve perche' gguf.quants.dequantize restituisce una
+        # colonna (n, 1) invece di un vettore: senza, l'assegnazione in un
+        # buffer 1-D fallisce con "could not broadcast (8192,1) into (8192,)".
+        # Il conteggio viene controllato perche' con il reshape un disaccordo
+        # passerebbe silenzioso e scriverebbe fuori dal buffer.
+        want = count * block_size
+        if piece.size != want:
+            raise ValueError(
+                f"la reference gguf ha restituito {piece.size} elementi "
+                f"per {want} attesi ({count} blocchi da {block_size}): i due "
+                f"non concordano"
+            )
+        out[written:written + want] = piece
+        written += want
 
     return _finish(out, shape)
 
