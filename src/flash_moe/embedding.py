@@ -227,7 +227,19 @@ def sample(
     if top_k > 0:
         keep = min(top_k, keep)
     if top_p > 0.0:
-        probs = np.exp(sorted_logits - np.max(sorted_logits))
+        # Il cumulativo si calcola SUL SET RIMASTO, non su tutta la
+        # distribuzione. In llama.cpp top_p riceve i candidati che top_k ha
+        # gia' ridotti (gli altri sono -INF) e llama_sampler_softmax_impl li
+        # rinormalizza, quindi cum_sum cammina sul set top-k: vedi
+        # llama_sampler_top_p_apply in llama-sampler.cpp:1556. Calcolarlo su
+        # tutta la distribuzione e poi intersecarlo con top_k dava un insieme
+        # piu' largo del richiesto, e si vedeva solo quando entrambi i filtri
+        # erano attivi, cioe' esattamente i parametri di default di generate().
+        # Con top_k=20 e top_p=0.90 il nucleo era di 15 token invece di 10:
+        # non un token sbagliato, un campionamento piu' casuale di quanto
+        # chiesto, che su un client streaming non si nota ma cambia l'output.
+        head = sorted_logits[:keep]
+        probs = np.exp(head - head[0])
         probs = probs / np.sum(probs)
         cumsum = np.cumsum(probs)
         top_p_cut = int(np.searchsorted(cumsum, top_p) + 1)
