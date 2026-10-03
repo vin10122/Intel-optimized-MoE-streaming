@@ -18,6 +18,12 @@ from pathlib import Path
 
 HEAD = re.compile(r"common_debug_cb_eval:\s+(.+?) = \(\w+\)")
 SUM = re.compile(r"^\s+sum = (\S+)")
+RMS = re.compile(r"^\s+rms = (\S+)")
+ARGMAX = re.compile(r"^\s+argmax = (\d+)")
+# La forma di uscita sta in coda alla riga di descrizione: "= {2048, 5, 1, 1}".
+# Serve al riferimento per sapere quanti elementi ha un tensore: senza, non si
+# puo' distinguere una somma significativa da una cancellazione.
+SHAPE = re.compile(r"=\s*\{([\d]+),\s*([\d]+),\s*([\d]+),\s*([\d]+)\}\s*$")
 NUM = re.compile(r"-?\d+\.\d+(?:e[+-]\d+)?")
 
 
@@ -38,21 +44,29 @@ def parse(path: Path) -> dict[str, dict]:
         m = HEAD.search(line)
         if m:
             name = m.group(1)
-            out.setdefault(name, {"sum": None, "rows": []})
+            out.setdefault(name, {"sum": None, "rms": None, "argmax": None,
+                                  "ne": None, "rows": []})
+            sm = SHAPE.search(line)
+            if sm:
+                ne = [int(v) for v in sm.groups()]
+                n = 1
+                for v in ne:
+                    n *= v
+                out[name]["ne"] = ne
+                out[name]["n"] = n
             continue
         if name is None:
             continue
-        m = SUM.match(line)
-        if m:
-            out[name]["sum"] = float(m.group(1))
-            continue
-        if line.strip().startswith("["):
-            out[name]["rows"] = []
-            for v in NUM.findall(line):
-                out[name]["rows"].append([float(v)])
-            continue
-        if out[name]["rows"] and DATA.match(line) and NUM.search(line):
-            out[name]["rows"].append([float(v) for v in NUM.findall(line)])
+        for regex, key in ((SUM, "sum"), (RMS, "rms"), (ARGMAX, "argmax")):
+            m = regex.match(line)
+            if m:
+                out[name][key] = float(m.group(1))
+                break
+        else:
+            if line.strip().startswith("["):
+                out[name]["rows"] = [[float(v) for v in NUM.findall(line)]]
+            elif out[name]["rows"] and DATA.match(line) and NUM.search(line):
+                out[name]["rows"].append([float(v) for v in NUM.findall(line)])
     return out
 
 
@@ -69,9 +83,13 @@ def main() -> int:
             continue
         if args.prefix and not name.startswith(args.prefix):
             continue
-        if rec["sum"] is None:
+        if rec["sum"] is None and rec["rms"] is None:
             continue
-        head = f"{name:40s} sum={rec['sum']:14.6f}"
+        head = (f"{name:44s} sum={rec['sum']:14.6f}"
+                if rec["sum"] is not None else f"{name:44s} {'-':>20s}")
+        head += f" rms={rec['rms']:12.6f}" if rec["rms"] is not None else ""
+        if rec["argmax"] is not None:
+            head += f" argmax={int(rec['argmax'])}"
         rows = rec["rows"]
         if rows:
             head += "  " + " ".join(f"{v:9.4f}" for v in rows[-1][:6])
