@@ -89,14 +89,36 @@ def sum_is_meaningful(want: dict) -> bool:
 def main() -> int:
     ref = json.loads(REF_PATH.read_text(encoding="utf-8"))
     ids = ref["tokens"]
+    devices = sys.argv[1:] or ["CPU"]
     print(f"riferimento: {REF_PATH.name}, prompt {ref['prompt']!r}, "
           f"token {ids}")
-    print(f"fonte dei valori: {ref['source']}\n")
+    print(f"fonte dei valori: {ref['source']}")
+    print(f"dispositivi da verificare: {', '.join(devices)}\n")
 
     path = model_path()
-    model = Qwen3MoEModel(path, device="CPU", max_seq_len=256, cache_capacity=64,
-                          dequant_fn=dequant_to_f16)
-    model.init_caches()
+    overall_bad = 0
+    for device in devices:
+        print(f"--- {device} " + "-" * (58 - len(device)))
+        rc = run_device(ref, ids, path, device)
+        overall_bad += rc
+
+    print(f"\n{'=' * 66}")
+    print(f" PASSATI: {ok}   FALLITI: {overall_bad}")
+    print(f"{'=' * 66}")
+    return 1 if overall_bad else 0
+
+
+def run_device(ref: dict, ids: list[int], path, device: str) -> int:
+    global ok
+    ok = 0
+    model = Qwen3MoEModel(path, device=device, max_seq_len=256,
+                          cache_capacity=64, dequant_fn=dequant_to_f16)
+    try:
+        model.init_caches()
+    except Exception as exc:  # il plugin puo' non esistere su questa macchina
+        check(f"{device}: il backend si inizializza", False, repr(exc))
+        model.close()
+        return 1
 
     x = model.embedding.forward(np.asarray(ids, dtype=np.int64))
     x = x.reshape(1, len(ids), model.hidden_size)
@@ -162,9 +184,8 @@ def main() -> int:
     check("token greedy", best == ref["final"]["argmax"],
           f"noi {best} llama.cpp {ref['final']['argmax']}")
 
-    print(f"\n{'=' * 66}\n PASSATI: {ok}   FALLITI: {bad}\n{'=' * 66}")
     model.close()
-    return 1 if bad else 0
+    return bad
 
 
 if __name__ == "__main__":
