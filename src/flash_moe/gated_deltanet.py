@@ -152,12 +152,17 @@ class GatedDeltaNetLayer:
         self.big32 = ({k: np.ascontiguousarray(weights[k], dtype=np.float32)
                        for k in self._big} if keep_f32 else None)
 
-        # ssm_conv1d e' (conv_kernel, conv_dim) nel GGUF: l'asse veloce e' il
-        # canale, quindi per il prodotto scalare per canale serve il
-        # trasposto, di forma (conv_dim, conv_kernel). Il trasposto e' fatto
-        # una volta sola qui, non a ogni token.
+        # ssm_conv1d arriva gia' come (conv_dim, conv_kernel): in
+        # ``ggml_compute_forward_ssm_conv_f32`` la riga del canale `ir0`
+        # parte da ``ir0 * nb[1]`` e ``nb[1]`` e' ``ne[0] * 4``, cioe' i 4
+        # valori del kernel di un canale sono consecutivi in memoria. Il
+        # prodotto con la finestra scorrevole vuole i canali sulle righe,
+        # quindi questa e' gia' la disposizione giusta e non serve un
+        # trasporto. Con ``reshape(conv_kernel, conv_dim).T`` si otteneva
+        # ``flat[k * conv_dim + c]`` invece di ``flat[c * conv_kernel + k]``:
+        # numeri della stessa ordine di grandezza, conv interamente sbagliata.
         self.conv_kernel_w = np.ascontiguousarray(
-            self.small["conv1d"].reshape(conv_kernel, self.conv_dim).T)
+            self.small["conv1d"].reshape(self.conv_dim, conv_kernel))
 
         # Stato in f32: la ricorrenza accumula su se stessa per tutta la
         # sequenza, e in f16 perderebbe il decadimento exp(gate) che si
@@ -223,7 +228,8 @@ class GatedDeltaNetLayer:
         l'asse di uscita per primo: e' la convenzione di ggml, dove
         ``wqkv`` e' ``{n_embd, key_dim*2 + value_dim}`` e la moltiplicazione
         e' ``input @ wqkv``. Qui si usa la stessa convenzione, quindi i pesi
-        si applicano senza trasporre.
+        si applicano senza trasporre: sono gia' (n_out, n_in) e basta il
+        ``.T`` nel prodotto, che BLAS esegue sulla vista senza copiarla.
 
         Si usa ``self.w32``, la copia f32 fatta una volta alla costruzione,
         non ``self.w``: riconvertire i pesi a ogni token costerebbe piu' di
@@ -231,10 +237,10 @@ class GatedDeltaNetLayer:
         (``keep_f32=False``) la conversione avviene qui, e questa e' la voce
         che domina il tempo del forward.
         """
-        qkv = x @ self.f32("qkv")
-        z = x @ self.f32("gate")
-        beta = _sigmoid(x @ self.small["beta"])
-        alpha = x @ self.small["alpha"]
+        qkv = x @ self.f32("qkv").T
+        z = x @ self.f32("gate").T
+        beta = _sigmoid(x @ self.small["beta"].T)
+        alpha = x @ self.small["alpha"].T
         return qkv, z, beta, alpha
 
     def _conv(self, qkv: np.ndarray) -> np.ndarray:
@@ -369,11 +375,11 @@ class GatedDeltaNetLayer:
         gated = rms * norm_w * _silu(z)
 
         flat = gated.reshape(-1)
-        # ssm_out e' l'unico peso SSM memorizzato come (value_dim, n_embd),
-        # cioe' con l'asse di uscita per secondo, al contrario di attn_qkv e
-        # attn_gate che sono (n_embd, ...). Qui il verso e' proprio quello
-        # della memorizzazione: flat (value_dim) @ out -> n_embd.
-        return flat @ self.f32("out")
+        # ssm_out e' l'unico peso SSM la cui memoria e' gia' (n_out, n_in)
+        # senza particolarita': il verso giusto e' il trasposto della forma
+        # del GGUF, fatto una volta sola in load_layer_weights. Qui il
+        # prodotto e' flat @ out.T, che BLAS esegue sulla vista.
+        return flat @ self.f32("out").T
 
 
 def is_recurrent_layer(tensor_map: dict, layer: int) -> bool:
@@ -385,6 +391,31 @@ def is_recurrent_layer(tensor_map: dict, layer: int) -> bool:
     layer con nomi diversi (``attn_qkv`` sul ricorrente, ``attn_q`` sull'altro).
     """
     return f"blk.{layer}.ssm_a" in tensor_map
+
+
+def _gguf_to_numpy(flat: np.ndarray, gguf_shape: tuple) -> np.ndarray:
+    """Porta un peso dalla memoria del GGUF alla disposizione numpy.
+
+    Nel GGUF l'asse 0 e' quello rapido: l'elemento (i0, i1) sta all'indizzo
+    ``i0 + ne0*i1``, quindi la memoria di un peso 2D e' gia' (out, in) e la
+    forma da usare in numpy e' l'inversa di quella del GGUF. Usare la forma
+    del GGUF al posto della sua inversa non da' errore: prodotto, reshape
+    e indice tornano tutti, e i numeri escono sbagliati. Verificato su
+    ``blk.0.attn_qkv``: leggendo la memoria come (2048, 8192) invece che
+    (8192, 2048), il primo valore della proiezione passa da 1,944 a 0,397
+    mentre llama.cpp dà 1,944. La proiezione risultava quindi sbagliata con
+    numeri della stessa ordine di grandezza, invisibile a ogni test che non
+    confronti con la reference.
+
+    ``ssm_conv1d`` non fa eccezione: anche li' la memoria e' (d_inner,
+    d_conv), cioe' l'inverso della forma del GGUF {d_conv, d_inner}, come
+    si legge in ``ggml_compute_forward_ssm_conv_f32``. Il prodotto con la
+    finestra scorrevole vuole pero' i canali sulle righe, quindi li' il
+    trasporto serve, e lo fa il ``__init__`` del layer.
+    """
+    if len(gguf_shape) == 1:
+        return np.ascontiguousarray(flat)
+    return np.ascontiguousarray(flat.reshape(gguf_shape[::-1]))
 
 
 def load_layer_weights(tensor_map: dict, layer: int,
@@ -404,24 +435,23 @@ def load_layer_weights(tensor_map: dict, layer: int,
         tensor = tensor_map[f"blk.{layer}.{name}"]
         shape = tuple(int(v) for v in tensor.shape)
         gtype = int(tensor.tensor_type)
+        n = int(np.prod(shape))
         if name_of(gtype) in ("F32", "F16"):
             dtype = np.float32 if name_of(gtype) == "F32" else np.float16
-            arr = np.ascontiguousarray(tensor.data, dtype=dtype)
-            weights[key] = np.ascontiguousarray(arr, dtype=np.float16).reshape(*shape)
-            return
-        raw = np.frombuffer(np.ascontiguousarray(tensor.data, dtype=np.uint8)
-                            .tobytes(), dtype=np.uint8)
-        n = int(np.prod(shape))
-        if dequant_fn is not None and len(shape) > 1:
-            out = dequant_fn(raw.tobytes(), gtype, n)
+            flat = np.ascontiguousarray(tensor.data, dtype=dtype).reshape(-1)
         else:
-            out = dequantize_to(raw, gtype, "f16")
-        arr = np.asarray(out, dtype=np.float16).reshape(-1)
-        if arr.size != n:
-            raise ValueError(
-                f"blk.{layer}.{name}: {arr.size} elementi, attesi {n}"
-            )
-        weights[key] = np.ascontiguousarray(arr, dtype=np.float16).reshape(*shape)
+            raw = np.frombuffer(np.ascontiguousarray(tensor.data, dtype=np.uint8)
+                                .tobytes(), dtype=np.uint8)
+            if dequant_fn is not None and len(shape) > 1:
+                out = dequant_fn(raw.tobytes(), gtype, n)
+            else:
+                out = dequantize_to(raw, gtype, "f16")
+            flat = np.asarray(out, dtype=np.float16).reshape(-1)
+            if flat.size != n:
+                raise ValueError(
+                    f"blk.{layer}.{name}: {flat.size} elementi, attesi {n}"
+                )
+        weights[key] = _gguf_to_numpy(flat, shape)
 
     weights: dict[str, np.ndarray] = {}
     load("attn_qkv.weight", "qkv")
@@ -434,3 +464,4 @@ def load_layer_weights(tensor_map: dict, layer: int,
     load("ssm_norm.weight", "norm")
     load("ssm_out.weight", "out")
     return weights
+

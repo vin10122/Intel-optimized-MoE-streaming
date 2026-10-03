@@ -77,7 +77,14 @@ def shared_expert_slices(tensor_map: dict, layer: int) -> dict[str, dict]:
             "offset": int(tensor.data_offset),
             "nbytes": int(tensor.n_bytes),
             "ggml_type": int(tensor.tensor_type),
-            "shape": tuple(int(v) for v in tensor.shape),
+            # La forma in numpy e' l'inversa di quella descritta dal GGUF,
+            # perche' e' la forma in cui i dati stanno nel file. llama.cpp
+            # crea questi tensor come {n_embd, n_ff}, quindi con l'hidden
+            # sull'asse veloce e l'n_ff come riga: in memoria sono
+            # (n_ff, n_embd). Usare la forma del GGUF non da' errore, da'
+            # la proiezione di un altro tensore (a ffn_gate la somma passava
+            # da -893,15 a 7,24).
+            "shape": tuple(int(v) for v in reversed(tensor.shape)),
         }
     return out
 
@@ -212,8 +219,11 @@ class SharedExpert:
         # farlo qui, una volta sola per chiamata e non per token.
         gate = _sigmoid((x @ np.asarray(weights["gate_inp"], dtype=np.float32)).reshape(()))
 
-        g = x @ np.asarray(weights["gate"], dtype=np.float32)
-        act = (g * _sigmoid(g)) * (x @ np.asarray(weights["up"], dtype=np.float32))
-        out = act @ np.asarray(weights["down"], dtype=np.float32)
+        # gate/up sono (n_ff, n_embd) e down e' (n_embd, n_ff), cioe' come
+        # stanno in memoria: il prodotto contrae l'hidden, quindi si traspone
+        # la vista e non l'array, e BLAS lo fa senza copia.
+        g = x @ np.asarray(weights["gate"], dtype=np.float32).T
+        act = (g * _sigmoid(g)) * (x @ np.asarray(weights["up"], dtype=np.float32).T)
+        out = act @ np.asarray(weights["down"], dtype=np.float32).T
 
         return (gate * out).astype(np.float32)

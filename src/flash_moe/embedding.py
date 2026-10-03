@@ -91,6 +91,16 @@ class LMHead:
     ``output.weight`` is stored as a large quantized tensor
     (Q6_K, shape ``(vocab_size, hidden)``).  The forward pass computes
     ``logits = activation @ weight.T``.
+
+    **I pesi stanno in f32 dal caricamento.** Il prodotto è 248320 × 2048,
+    cioè 508M di pesi: convertirli da f16 a f32 a ogni token costava 872 ms
+    isolati e 1236 ms nel modello, cioè il 21% del token, per un GEMV che in
+    BLAS f32 fa 31,5 ms. Con i pesi già in f32 la conversione non la fa
+    nessuno: 27,7x, e il risultato è identico bit per bit perché f16 → f32 non
+    perde cifre. Costo: 970 MiB di f16 diventano 1940 MiB di f32, e la
+    dequantizzazione al caricamento deve ancora passare da f16, che è il
+    percorso che il modello usava già: i valori sono quelli di prima, arrotondati
+    a f16 nello stesso punto.
     """
 
     def __init__(self, weight: np.ndarray, vocab_size: int, hidden_size: int) -> None:
@@ -99,14 +109,14 @@ class LMHead:
                 f"lm_head weight shape {weight.shape} != "
                 f"({vocab_size}, {hidden_size})"
             )
-        self.weight = np.ascontiguousarray(weight, dtype=np.float16)
+        self.weight = np.ascontiguousarray(weight, dtype=np.float32)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        # Righe di vocabolario per passo. numpy upcasterebbe l'intera matrice
-        # f16 in f32 (1941 MiB su questo modello) a ogni chiamata se il
-        # operands fosse misto: si converte un blocco alla volta e si tiene il
-        # BLAS f32, che e' l'unico veloce (il GEMM f16 in numpy e' 40x piu'
-        # lento: 1794 ms contro 44 ms su questo stesso prodotto).
+        # Il ciclo su blocchi resta, ma non serve piu' a contenere la memoria
+        # di staging: il blocco e' una vista dei pesi, non una copia. Serve a
+        # tenere ogni scrittura dei logits dentro una finestra contigua.
+        # Cambiare il blocco cambierebbe il blocking del GEMM e con esso gli
+        # ultimi bit del risultato, quindi il valore viene lasciato com'e'.
         self.chunk_rows = 8192
 
     @classmethod
@@ -155,9 +165,8 @@ class LMHead:
         logits = np.empty((h.shape[0], self.vocab_size), dtype=np.float32)
         for start in range(0, self.vocab_size, self.chunk_rows):
             stop = min(start + self.chunk_rows, self.vocab_size)
-            # Staging limitato a chunk_rows: il resto dei pesi resta f16 in RAM.
-            block = self.weight[start:stop].astype(np.float32)
-            logits[:, start:stop] = h @ block.T
+            # Il blocco e' una vista sui pesi f32: niente staging, niente cast.
+            logits[:, start:stop] = h @ self.weight[start:stop].T
 
         logits = logits.reshape(*hidden.shape[:-1], self.vocab_size)
         if squeezed:

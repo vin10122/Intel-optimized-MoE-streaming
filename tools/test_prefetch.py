@@ -53,11 +53,16 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def swiglu_numpy(x: np.ndarray, gate: np.ndarray, up: np.ndarray,
-                 down: np.ndarray) -> np.ndarray:
-    g = x @ gate
-    u = x @ up
+                down: np.ndarray) -> np.ndarray:
+    """SwiGLU in numpy, con i pesi come stanno in memoria.
+
+    gate/up sono (n_ff, n_hidden) e down e' (n_hidden, n_ff), quindi il
+    prodotto contrae l'hidden e serve la vista trasposta.
+    """
+    g = x @ gate.T
+    u = x @ up.T
     h = (g / (1.0 + np.exp(-g))) * u
-    return (h @ down).flatten()
+    return (h @ down.T).flatten()
 
 
 def read_expert_sync(gguf_path: Path, tmap: dict, names: dict,
@@ -103,7 +108,7 @@ def main() -> int:
 
     names = {r: f"blk.0.ffn_{r}_exps.weight" for r in ("gate", "up", "down")}
     layer_types = layer_types_map[0]
-    shapes = {"gate": (HIDDEN, INTER), "up": (HIDDEN, INTER), "down": (INTER, HIDDEN)}
+    shapes = {"gate": (INTER, HIDDEN), "up": (INTER, HIDDEN), "down": (HIDDEN, INTER)}
 
     # ---------------------------------------------------------------- A
     print("\n A. prefetch produce dati identici a lettura sincrona")
@@ -126,9 +131,9 @@ def main() -> int:
           f"prefetch_hits={store_b.stats.prefetch_hits}")
     check("miss count == 0 dopo prefetch", store_b.stats.misses == 0,
           f"misses={store_b.stats.misses}")
-    check("hits resta 0: il prefetch non è un hit di cache",
+    check("hits resta 0: il prefetch non Ã¨ un hit di cache",
           store_b.stats.hits == 0, f"hits={store_b.stats.hits}")
-    # Access an unfetched expert — should be a miss
+    # Access an unfetched expert â€” should be a miss
     store_b.read_tensor(ExpertKey(0, 31), "gate")
     check("miss count > 0 per expert non-prefetched", store_b.stats.misses > 0,
           f"misses={store_b.stats.misses}")
@@ -176,7 +181,7 @@ def main() -> int:
     w32 = {}
     for r in ("gate", "up", "down"):
         t = tmap[names[r]]
-        shape = tuple(int(v) for v in t.shape)[:2]
+        shape = tuple(int(v) for v in t.shape)[:2][::-1]
         w32[r] = dequantize_to(sync_bytes[r], int(t.tensor_type), "f32").reshape(shape)
     ref = swiglu_numpy(x, w32["gate"], w32["up"], w32["down"])
     rel = float(np.abs(out_e.astype(np.float64) - ref).max() / max(float(np.abs(ref).max()), 1e-9))
@@ -211,3 +216,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -281,12 +281,15 @@ def test_backend() -> None:
         key = ExpertKey(0, 0)
         out = backend.forward(key, x, hidden, inter)
 
-        # I pesi della mock sono f16, come quelli che il backend si aspetta.
-        gate = np.frombuffer(store.read_tensor(key, "gate"), np.float16).astype(np.float32).reshape(hidden, inter)
-        up = np.frombuffer(store.read_tensor(key, "up"), np.float16).astype(np.float32).reshape(hidden, inter)
-        down = np.frombuffer(store.read_tensor(key, "down"), np.float16).astype(np.float32).reshape(inter, hidden)
-        gp = x @ gate
-        ref = (gp * (1.0 / (1.0 + np.exp(-gp)))) * (x @ up) @ down
+        # I pesi della mock sono f16, come quelli che il backend si aspetta, e
+        # sono reshaped nella disposizione in cui stanno nel GGUF: gate/up
+        # (n_ff, n_hidden), down (n_hidden, n_ff). Il prodotto contrae
+        # l'hidden, quindi si trasposta la vista e non l'array.
+        gate = np.frombuffer(store.read_tensor(key, "gate"), np.float16).astype(np.float32).reshape(inter, hidden)
+        up = np.frombuffer(store.read_tensor(key, "up"), np.float16).astype(np.float32).reshape(inter, hidden)
+        down = np.frombuffer(store.read_tensor(key, "down"), np.float16).astype(np.float32).reshape(hidden, inter)
+        gp = x @ gate.T
+        ref = (gp * (1.0 / (1.0 + np.exp(-gp)))) * (x @ up.T) @ down.T
 
         check("backend: output non e' tutto zero", float(np.abs(out).max()) > 0)
         err = float(np.abs(out - ref).max() / np.abs(ref).max())

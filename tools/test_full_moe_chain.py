@@ -11,7 +11,7 @@ Per ogni layer:
   3. Reference: gguf.quants.dequantize(f32) + NumPy SwiGLU + weighted sum
   4. Confronta output entro tolleranza f16
 
-In più: 1 run completo della catena (40 layer concatenati) per timing.
+In piÃ¹: 1 run completo della catena (40 layer concatenati) per timing.
 """
 
 from __future__ import annotations
@@ -63,9 +63,9 @@ def numpy_moe_layer(x: np.ndarray, layer: int, expert_ids: list[int],
     combined = np.zeros(HIDDEN, dtype=np.float32)
     for eid, w in zip(expert_ids, weights):
         tensors: dict[str, np.ndarray] = {}
-        for role, shp in (("gate", (HIDDEN, INTER)),
-                          ("up", (HIDDEN, INTER)),
-                          ("down", (INTER, HIDDEN))):
+        for role, shp in (("gate", (INTER, HIDDEN)),
+                          ("up", (INTER, HIDDEN)),
+                          ("down", (HIDDEN, INTER))):
             t = tmap[f"blk.{layer}.ffn_{role}_exps.weight"]
             per = t.n_bytes // n_experts
             with gguf_path.open("rb") as fh:
@@ -73,10 +73,10 @@ def numpy_moe_layer(x: np.ndarray, layer: int, expert_ids: list[int],
                 raw = fh.read(per)
             arr = dequantize_to(raw, int(t.tensor_type), "f32").reshape(shp)
             tensors[role] = arr
-        g = x @ tensors["gate"]
-        u = x @ tensors["up"]
+        g = x @ tensors["gate"].T
+        u = x @ tensors["up"].T
         h = (g / (1.0 + np.exp(-g))) * u
-        out = (h @ tensors["down"]).flatten()
+        out = (h @ tensors["down"].T).flatten()
         combined += w * out
     return combined
 
@@ -202,3 +202,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

@@ -19,7 +19,7 @@ import numpy as np
 
 from flash_moe.gated_deltanet import (
     GatedDeltaNetLayer, is_recurrent_layer, _l2_normalize, _sigmoid,
-    _softplus, _silu,
+    _softplus, _silu, load_layer_weights,
 )
 
 ok = bad = 0
@@ -113,17 +113,12 @@ def load_f16(name, shape):
         return flat.reshape(shape)
     return dequant_to_f16(t.data, t.tensor_type, want).reshape(shape)
 
-w = {
-    "qkv": load_f16("attn_qkv.weight", (EMBD, conv_dim)),
-    "gate": load_f16("attn_gate.weight", (EMBD, value_dim)),
-    "beta": load_f16("ssm_beta.weight", (EMBD, TSR)),
-    "alpha": load_f16("ssm_alpha.weight", (EMBD, TSR)),
-    "conv1d": load_f16("ssm_conv1d.weight", (CONV_K, conv_dim)),
-    "dt_bias": load_f16("ssm_dt.bias", (TSR,)),
-    "a": load_f16("ssm_a", (TSR,)),
-    "norm": load_f16("ssm_norm.weight", (D_K,)),
-    "out": load_f16("ssm_out.weight", (value_dim, EMBD)),
-}
+# I pesi vengono da load_layer_weights, la stessa funzione che usa il
+# modello: stabilire qui le forme significa ricostruire in un secondo
+# posto la convenzione di orientamento, ed e' esattamente il punto in cui
+# questo test potrebbe dare un falso ok sul runtime.
+w = load_layer_weights(tensors, 0, dequant_to_f16)
+w = {k: np.asarray(v) for k, v in w.items()}
 check("ssm_a negativity (contiene -exp(A_log))",
       bool(np.all(w["a"].astype(np.float32) < 0)),
       f"max={float(w['a'].max()):.4f}")
@@ -168,13 +163,13 @@ ref_conv = np.zeros((conv_dim, CONV_K - 1), dtype=np.float64)
 w64 = {k: v.astype(np.float64) for k, v in w.items()}
 
 def ref_step(x, state, conv, transpose=False):
-    qkv = x @ w64["qkv"]
-    beta = _sigmoid(x @ w64["beta"])
-    alpha = x @ w64["alpha"]
+    qkv = x @ w64["qkv"].T
+    beta = _sigmoid(x @ w64["beta"].T)
+    alpha = x @ w64["alpha"].T
     gate = _softplus(alpha + w64["dt_bias"]) * w64["a"]
     seq = np.concatenate([conv, qkv.reshape(conv_dim, 1)], axis=1)
     conv = seq[:, 1:].copy()
-    c = _silu(np.einsum("ck,ck->c", seq, w64["conv1d"].T))
+    c = _silu(np.einsum("ck,ck->c", seq, w64["conv1d"]))
     q = _l2_normalize(c[:key_dim].reshape(N_K, D_K)) / np.sqrt(D_K)
     k = _l2_normalize(c[key_dim:2*key_dim].reshape(N_K, D_K))
     vv = c[2*key_dim:].reshape(N_V, D_V)
@@ -191,11 +186,11 @@ def ref_step(x, state, conv, transpose=False):
         state[h] = S
         outs.append((S.T @ q[h]) if transpose else (S @ q[h]))
     head = np.array(outs)
-    zr = (x @ w64["gate"]).reshape(N_V, D_V)
+    zr = (x @ w64["gate"].T).reshape(N_V, D_V)
     rms = head / np.sqrt(np.mean(head ** 2, axis=-1, keepdims=True) + 1e-6)
     gated = (rms * w64["norm"] * _silu(zr)).reshape(-1)
-    # ssm_out e' (value_dim, n_embd): il verso e' gia' quello giusto.
-    return gated @ w64["out"], state, conv
+    # ssm_out e' (n_embd, value_dim): il prodotto contrae il value_dim.
+    return gated @ w64["out"].T, state, conv
 
 for step in range(3):
     x = (rng.standard_normal(EMBD) * 1.0).astype(np.float32)
@@ -241,3 +236,4 @@ check("30 layer SSM", len(rec) == 30, f"primi 5: {rec[:5]}")
 
 print(f"\n{'=' * 66}\n PASSATI: {ok}   FALLITI: {bad}\n{'=' * 66}")
 sys.exit(1 if bad else 0)
+

@@ -72,10 +72,15 @@ TEST_LAYERS = [
 
 def swiglu_numpy(x: np.ndarray, gate: np.ndarray, up: np.ndarray,
                  down: np.ndarray) -> np.ndarray:
-    g = x @ gate
-    u = x @ up
+    """SwiGLU in numpy, con i pesi nella disposizione in cui stanno nel file.
+
+    gate/up sono (n_ff, n_embd) e down e' (n_embd, n_ff): il prodotto contrae
+    l'hidden, quindi si trasposta la vista e non l'array.
+    """
+    g = x @ gate.T
+    u = x @ up.T
     h = (g / (1.0 + np.exp(-g))) * u
-    return (h @ down).flatten()
+    return (h @ down.T).flatten()
 
 
 def read_expert_tensor_raw(gguf_path: Path, tensor, expert_id: int,
@@ -148,13 +153,13 @@ def main() -> int:
         w32_ref = {}
         for r in ("gate", "up", "down"):
             raw, gtype = read_expert_tensor_raw(gguf_path, tmap[names[r]], expert, n_experts)
-            shape = tuple(int(v) for v in tmap[names[r]].shape)[:2]
+            shape = tuple(int(v) for v in tmap[names[r]].shape)[:2][::-1]
             w32_ref[r] = dequantize_to(raw, gtype, "f32").reshape(shape)
 
         for r in ("gate", "up", "down"):
             ref = w32_ref[r]
             absmax = float(np.abs(ref).max())
-            rel = float(np.abs(w16[r].astype(np.float32) - ref).max() / max(absmax, 1e-9))
+            rel = float(np.abs(np.asarray(w16[r], dtype=np.float32).reshape(ref.shape) - ref).max() / max(absmax, 1e-9))
             check(f"dequant {r} C++ == gguf.ref", rel < DEQUANT_TOL, f"rel={rel:.3e}")
 
         # D. Forward pass: OpenVINO vs NumPy
@@ -196,3 +201,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+

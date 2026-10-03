@@ -110,13 +110,15 @@ for e in (0, 3):
     got = be.forward(k, x, H, I)
     be.clear_cache()
     w = {}
-    for role, shp in (("gate", (H, I)), ("up", (H, I)), ("down", (I, H))):
+    # I pesi sono nel verso in cui stanno nel file: gate/up su n_ff, down su
+    # n_hidden. Il prodotto contrae l'hidden, quindi si trasposta la vista.
+    for role, shp in (("gate", (I, H)), ("up", (I, H)), ("down", (H, I))):
         raws = be.store.read_tensor(k, role)
         w[role] = dequant_to_f16(raws, ttypes[0][role], H * I).reshape(
             shp).astype(np.float32)
     # stesse matrici del backend: x @ gate, silu, poi @ down
-    g = x @ w["gate"]
-    ref = (g * (1 / (1 + np.exp(-g)))) * (x @ w["up"]) @ w["down"]
+    g = x @ w["gate"].T
+    ref = (g * (1 / (1 + np.exp(-g)))) * (x @ w["up"].T) @ w["down"].T
     rel = float(np.abs(got - ref).max() / max(1e-9, float(np.abs(ref).max())))
     check(f"expert {e}: OpenVINO = NumPy entro f16", rel < 5e-3, f"(rel={rel:.2e})")
 

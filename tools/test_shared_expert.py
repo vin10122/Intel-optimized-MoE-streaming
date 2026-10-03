@@ -42,8 +42,8 @@ check("tutti i 40 layer lo hanno", n_with == N_LAYER, f"({n_with}/{N_LAYER})")
 
 print("\n2. forme dei tensor")
 sl = shared_expert_slices(tmap, 0)
-for role, want in (("gate_inp", (H,)), ("gate", (H, I)),
-                   ("up", (H, I)), ("down", (I, H))):
+for role, want in (("gate_inp", (H,)), ("gate", (I, H)),
+                   ("up", (I, H)), ("down", (H, I))):
     got = sl[role]["shape"]
     check(f"{role} shape {got}", got == want, f"(atteso {want})")
 
@@ -59,8 +59,8 @@ check("monotona", bool(np.all(np.diff(s) >= 0)))
 print("\n4. caricamento e forma degli output")
 se = SharedExpert(path, num_layers=2, hidden_size=H, intermediate_size=I)
 check("2 layer caricati", len(se.layers) == 2, f"({sorted(se.layers)})")
-for role, want in (("gate_inp", (H,)), ("gate", (H, I)),
-                   ("up", (H, I)), ("down", (I, H))):
+for role, want in (("gate_inp", (H,)), ("gate", (I, H)),
+                   ("up", (I, H)), ("down", (H, I))):
     got = se.layers[0][role].shape
     check(f"pesi {role} {got}", got == want, f"atteso {want} dtype f32")
 
@@ -104,9 +104,9 @@ check("ripristinato -> contributo intermedio",
 w = se.layers[0]
 x1 = rng.standard_normal(H).astype(np.float32)
 g = x1 @ w["gate_inp"].astype(np.float32)
-gg = x1 @ w["gate"].astype(np.float32)
-act = (gg * _sigmoid(gg)) * (x1 @ w["up"].astype(np.float32))
-unscaled = act @ w["down"].astype(np.float32)
+gg = x1 @ w["gate"].astype(np.float32).T
+act = (gg * _sigmoid(gg)) * (x1 @ w["up"].astype(np.float32).T)
+unscaled = act @ w["down"].astype(np.float32).T
 scaled = se.forward(0, x1)
 ratio = float(np.linalg.norm(scaled) / (np.linalg.norm(unscaled) + 1e-30))
 check("rapporto = sigmoid(gate_inp)", abs(ratio - float(_sigmoid(g.reshape(())))) < 1e-4,

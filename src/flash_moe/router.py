@@ -103,6 +103,17 @@ class ExpertRouter:
         vicino si ribalta, e con 2048 termini per il prodotto l'errore
         relativo del gate si accumula. Vedere tools/test_router.py, che
         misura la frequenza con cui accade.
+
+        Nei log di llama.cpp il gate appare come
+        ``MUL_MAT(blk.0.ffn_gate_inp.weight{2048, 256}, ...) = {256, ...}``:
+        l'asse veloce del tensore e' l'hidden, quindi in memoria e'
+        ``(n_expert, n_hidden)`` e non ``(n_hidden, n_expert)``. Usare la
+        forma del GGUF cosi' com'e' scambia i due assi: il prodotto
+        ``x @ gate`` non da' piu' i punteggi degli expert, e perche' i
+        punteggi escano sbagliati restano quasi tutti uguali, i pesi di
+        routing diventano quasi uniformi (0.127, 0.126, 0.125...) invece
+        che distinti. Il reshape mette in fila quello che c'e' davvero, e
+        ``_normalize_gate`` fa la trasposizione.
         """
         shape = tuple(int(s) for s in reversed(tensor.shape))
         if shape not in ((num_experts, hidden_size), (hidden_size, num_experts)):
@@ -110,11 +121,17 @@ class ExpertRouter:
                 f"ffn_gate_inp shape {shape} does not match "
                 f"{num_experts} experts x {hidden_size} hidden"
             )
+        gate = np.asarray(tensor.data)
+        if gate.size != num_experts * hidden_size:
+            raise ValueError(
+                f"ffn_gate_inp has {gate.size} elements, expected "
+                f"{num_experts * hidden_size}"
+            )
         return cls(
             hidden_size=hidden_size,
             num_experts=num_experts,
             top_k=top_k,
-            gate_weights=np.asarray(tensor.data, dtype=gate_dtype),
+            gate_weights=gate.reshape(shape).astype(gate_dtype, copy=False),
             gate_dtype=gate_dtype,
         )
 

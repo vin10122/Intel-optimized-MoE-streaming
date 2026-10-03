@@ -105,8 +105,10 @@ def main() -> int:
         ).reshape(out_shape)
 
     diff = np.abs(lm_head.weight - ref_out_weight.astype(np.float16)).max()
-    print(f"  Max diff vs reference (both f16): {diff:.3e}")
+    print(f"  Max diff vs reference (f16 rounding): {diff:.3e}")
     check("LM head weights bit-exact vs reference", diff == 0.0, f"diff={diff:.3e}")
+    check("LM head weights tenuti in f32", lm_head.weight.dtype == np.float32,
+          f"{lm_head.weight.dtype}")
 
     # Test forward: hidden -> logits
     hidden = np.random.randn(2048).astype(np.float32) * 0.01
@@ -116,6 +118,16 @@ def main() -> int:
     print(f"  Logits shape: {logits.shape}")
     check("LM head forward matches NumPy", diff < 1e-2, f"rel={diff:.3e}")
     check("No NaN in LM head output", not np.isnan(logits).any())
+
+    # I pesi in f32 non devono cambiare il risultato rispetto al percorso
+    # precedente, che li upcastava da f16 a ogni blocco. Stessi numeri in
+    # entrata, stesso blocking, quindi la differenza deve essere zero esatta:
+    # un confronto "abbastanza vicino" qui lascerebbe passare un doppio
+    # arrotondamento, che e' esattamente il difetto che il test deve chiudere.
+    staged = hidden @ lm_head.weight.astype(np.float16).astype(np.float32).T
+    diff_exact = np.abs(logits - staged).max()
+    check("logits identici al percorso con staging f16", diff_exact == 0.0,
+          f"max|diff|={diff_exact:.3e}")
 
     # =====================================================================
     # Test 3: Single token embedding + LM head round-trip

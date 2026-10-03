@@ -41,10 +41,15 @@ def check(label, cond, detail=""):
 
 
 def swiglu_reference(x, gate, up, down):
-    """SwiGLU scritto a parte, in numpy, senza OpenVINO."""
-    g = x.astype(np.float32) @ gate.astype(np.float32)
-    act = (g * _sigmoid(g)) * (x.astype(np.float32) @ up.astype(np.float32))
-    return (act @ down.astype(np.float32)).astype(np.float32)
+    """SwiGLU scritto a parte, in numpy, senza OpenVINO.
+
+    gate/up sono (n_ff, n_embd) e down e' (n_embd, n_ff), cioe' come stanno
+    in memoria: il prodotto contrae l'hidden, quindi si trasposta la vista.
+    """
+    x = x.astype(np.float32)
+    g = x @ gate.astype(np.float32).T
+    act = (g * _sigmoid(g)) * (x @ up.astype(np.float32).T)
+    return (act @ down.astype(np.float32).T).astype(np.float32)
 
 
 print("1. backend OpenVINO: share_inputs non cambia il risultato")

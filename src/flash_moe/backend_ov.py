@@ -107,17 +107,27 @@ class OpenVINOExpertBackend:
 
         wtype = ov.Type.f16
         x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
-        gate = ops.parameter([hidden_size, intermediate_size], wtype, name="gate")
-        up = ops.parameter([hidden_size, intermediate_size], wtype, name="up")
-        down = ops.parameter([intermediate_size, hidden_size], wtype, name="down")
+        # I pesi sono gia' nella disposizione in cui stanno nel GGUF: gate e up
+        # sono (n_ff, n_embd), down e' (n_embd, n_ff). Il GGUF li descrive come
+        # {n_embd, n_ff, n_expert}, cioe' con l'hidden sull'asse veloce, quindi
+        # in memoria l'n_ff e' la riga: e' quella che va letta, non la sua
+        # trasposta. Dichiarare qui la forma inversa e moltiplicare per
+        # transpose_b evita sia di trasporre gli array a ogni expert (2 MiB
+        # per expert, 320 expert per token) sia di sbagliare i numeri: con
+        # transpose_b=False su un array letto cosi' il prodotto non dava
+        # errore, dava la proiezione di un altro tensor (a ffn_gate la somma
+        # passava da -893,15 a 7,24).
+        gate = ops.parameter([intermediate_size, hidden_size], wtype, name="gate")
+        up = ops.parameter([intermediate_size, hidden_size], wtype, name="up")
+        down = ops.parameter([hidden_size, intermediate_size], wtype, name="down")
 
         xc = ops.convert(x, wtype)
-        gate_proj = ops.matmul(xc, gate, transpose_a=False, transpose_b=False)
-        up_proj = ops.matmul(xc, up, transpose_a=False, transpose_b=False)
+        gate_proj = ops.matmul(xc, gate, transpose_a=False, transpose_b=True)
+        up_proj = ops.matmul(xc, up, transpose_a=False, transpose_b=True)
         # SwiGLU: silu(gate) * up, scritto come gate * sigmoid(gate) * up.
         act = ops.multiply(gate_proj, ops.sigmoid(gate_proj))
         out = ops.matmul(ops.multiply(act, up_proj), down,
-                         transpose_a=False, transpose_b=False)
+                         transpose_a=False, transpose_b=True)
 
         model = ov.Model([ops.convert(out, ov.Type.f32)], [x, gate, up, down],
                          name="SwiGLU_Expert")
@@ -137,16 +147,20 @@ class OpenVINOExpertBackend:
             self._weight_order.append(key)
             return cached
 
+        # gate/up stanno in memoria come (n_ff, n_hidden) e down come
+        # (n_hidden, n_ff): sono le forme che il grafo si aspetta, vedi
+        # ``_get_request``. Il reshape e' su quello che c'e' nel file, senza
+        # trasporre: cosi' il dequant scrive gia' nella disposizione giusta.
         layer_types = self.tensor_types.get(key.layer, {})
         gate = self._decode(self.store.read_tensor(key, "gate"),
                             layer_types.get("gate"),
-                            (hidden_size, intermediate_size))
+                            (intermediate_size, hidden_size))
         up = self._decode(self.store.read_tensor(key, "up"),
                           layer_types.get("up"),
-                          (hidden_size, intermediate_size))
+                          (intermediate_size, hidden_size))
         down = self._decode(self.store.read_tensor(key, "down"),
                             layer_types.get("down"),
-                            (intermediate_size, hidden_size))
+                            (hidden_size, intermediate_size))
 
         weights = (gate, up, down)
         self._weight_cache[key] = weights
