@@ -48,6 +48,14 @@ from .dequant import dequantize_to
 DEVICE_PREFERENCE = ("CPU", "GPU", "NPU")
 
 
+# Buffer di riciclo per classe di grandezza: bastano pochi array
+# per evitare i page fault delle allocazioni nuove (vedi
+# ``_release``). Indipendente da ``cache_capacity``: con una cache
+# grande trattenere un buffer per ogni slot di cache e' memoria
+# sprecata che manda in paging.
+_POOL_MAX = 16
+
+
 def pick_device(core: ov.Core, requested: str = "AUTO") -> str:
     available = list(core.available_devices)
     if requested != "AUTO" and requested in available:
@@ -178,10 +186,14 @@ class OpenVINOExpertBackend:
         un buffer evictato non e' piu' letto da nessuno. Tenerlo in una lista
         di riuso evita che il prossimo expert debba faultare pagine nuove.
 
-        I pool sono limitati a ``cache_capacity`` elementi: la cache cresce
-        oltre perche' il prefetch riempie le prime voci, ma i buffer non
-        devono crescere con lei, altrimenti la RAM non tornerebbe piu' al
-        valore iniziale.
+        I pool sono limitati a pochi buffer per classe: servono a
+        evitare i page fault delle allocazioni nuove, non a trattenere
+        memoria. Il limite non dipende da ``cache_capacity``: con
+        capacity=700 trattenere 700 buffer per classe (2 classi da
+        ~17 MB) chiede ~23 GB e il sistema va in paging, misurato:
+        il decode passava da 7,2 s a 23,7 s a token. Una manciata di
+        buffer per classe e' tutto ciò che serve, il riciclo e'
+        sequenziale.
         """
         if weights is None:
             return
@@ -190,7 +202,7 @@ class OpenVINOExpertBackend:
             slot = self._pool.get(n)
             if slot is None:
                 self._pool[n] = [array]
-            elif len(slot) < max(1, self.cache_capacity):
+            elif len(slot) < _POOL_MAX:
                 slot.append(array)
 
     def _acquire(self, n_elements: int) -> np.ndarray:
