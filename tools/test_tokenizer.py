@@ -7,6 +7,15 @@ test controlla la fedeltà, non solo che non crashi.
 import sys
 sys.path.insert(0, 'src')
 
+# La console di Windows e' cp1252 e non sa scrivere le etichette con gli
+# accenti che questi casi usano: senza questo il test muore su un carattere
+# invece di dire cosa ha trovato.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import gguf
 from flash_moe.paths import model_path
 from flash_moe.tokenizer import GGUFTokenizer

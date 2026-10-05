@@ -58,6 +58,10 @@ scratch/
 # Logs
 *.log
 bench_phases_out.txt
+# Output dei bisect e dei dump di confronto con llama.cpp: rigenerabili, e il
+# dump pesa qualche megabyte.
+bisect_*_out.txt
+lc_moe_dump.txt
 
 # Kilo agent manager (worktrees + stato sessioni)
 .kilo/

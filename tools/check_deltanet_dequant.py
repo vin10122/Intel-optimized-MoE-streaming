@@ -20,6 +20,15 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella")
+
+# La console di Windows e' cp1252 e non sa scrivere i caratteri che questo
+# test usa nelle etichette: senza questo muore su un accento invece di dire
+# cosa ha trovato.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 sys.path.insert(0, str(ROOT / "src"))
 
 import gguf  # noqa: E402
