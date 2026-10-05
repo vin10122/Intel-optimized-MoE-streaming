@@ -448,6 +448,63 @@ class Qwen3MoEModel:
         """
         return self.blocks[layer_idx].forward(x, seq_offset)
 
+    def stream(
+        self,
+        input_ids: list[int],
+        max_new_tokens: int = 1,
+        temperature: float = 1.0,
+        top_k: int = 20,
+        top_p: float = 0.95,
+        seed: int = 42,
+    ):
+        """Genera un token alla volta, e lo consegna prima di continuare.
+
+        ``generate`` e' questo metodo con la risposta raccolta in una lista:
+        il ciclo e' scritto una volta sola qui, quindi i due percorsi non
+        possono divergere. Serve il metodo separato perche' un client
+        streaming deve mostrare il token appena esiste, e non puo' aspettare
+        che la generazione finisca: a 0,21 tok/s un prompt di 20 token arriva
+        dopo un minuto e mezzo.
+
+        Yields:
+            (indice da 1, token id) a ogni token prodotto. L'indice parte da 1
+            perche' al cliente interessa la posizione nel testo generato, non
+            nel prompt.
+        """
+        if not input_ids:
+            raise ValueError("input_ids vuoto: niente da cui generare")
+        self.init_caches()
+        rng = np.random.default_rng(seed)
+
+        # Prefillo: tutto il prompt, in un colpo.
+        x = self.embedding.forward(np.asarray(input_ids, dtype=np.int64))
+        x = x.reshape(1, len(input_ids), self.hidden_size)
+        x = self._forward_all(x)
+
+        for produced in range(1, max_new_tokens + 1):
+            logits = self.output_norm.forward(x)
+            logits = self.lm_head.forward(logits)
+            # (1, seq, vocab) -> solo l'ultima posizione: e' li' che si
+            # campiona. logit[-1] avrebbe restituito tutta la sequenza.
+            last_logits = np.asarray(logits[0, -1], dtype=np.float32).reshape(-1)
+
+            next_token = sample(
+                last_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                rng=rng,
+            )
+            yield produced, next_token
+            if next_token == self.eos_token_id:
+                break
+
+            # Decode: un token alla volta, con lo stato dei layer ricorrenti
+            # e la cache KV gia' avanti di un passo.
+            x = self.embedding.forward(np.asarray([next_token], dtype=np.int64))
+            x = x.reshape(1, 1, self.hidden_size)
+            x = self._forward_all(x)
+
     def generate(
         self,
         input_ids: list[int],
@@ -471,42 +528,14 @@ class Qwen3MoEModel:
         Returns:
             I token generati, prompt compreso.
         """
-        if not input_ids:
-            raise ValueError("input_ids vuoto: niente da cui generare")
-        self.init_caches()
-        rng = np.random.default_rng(seed)
-        generated = list(input_ids)
-
-        # Prefillo: tutto il prompt, in un colpo.
-        x = self.embedding.forward(np.asarray(generated, dtype=np.int64))
-        x = x.reshape(1, len(generated), self.hidden_size)
-        x = self._forward_all(x)
-
-        for _ in range(max_new_tokens):
-            logits = self.output_norm.forward(x)
-            logits = self.lm_head.forward(logits)
-            # (1, seq, vocab) -> solo l'ultima posizione: e' li' che si
-            # campiona. logit[-1] avrebbe restituito tutta la sequenza.
-            last_logits = np.asarray(logits[0, -1], dtype=np.float32).reshape(-1)
-
-            next_token = sample(
-                last_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                rng=rng,
-            )
-            generated.append(next_token)
-            if next_token == self.eos_token_id:
-                break
-
-            # Decode: un token alla volta, con lo stato dei layer ricorrenti
-            # e la cache KV gia' avanzati di un passo.
-            x = self.embedding.forward(np.asarray([next_token], dtype=np.int64))
-            x = x.reshape(1, 1, self.hidden_size)
-            x = self._forward_all(x)
-
-        return generated
+        return list(input_ids) + [token for _, token in self.stream(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+        )]
 
     def _forward_all(self, x: np.ndarray) -> np.ndarray:
         """Attraversa tutti i 40 layer nell'ordine, ricorrenti e attenzione."""
