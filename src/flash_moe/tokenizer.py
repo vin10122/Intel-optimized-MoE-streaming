@@ -14,6 +14,7 @@ Verifiche:
 """
 from __future__ import annotations
 
+import codecs
 from typing import Any
 
 import numpy as np
@@ -139,3 +140,80 @@ class GGUFTokenizer:
             f"bos={self.bos_id} eos={self.eos_id}")
 
         return checks
+
+
+class StreamingDetokenizer:
+    """Detokenizzazione incrementale: un token alla volta, come fa un client.
+
+    ``GGUFTokenizer.decode`` lavora su un blocco di id e va bene per un
+    renderer che aspetta la risposta intera. Un client streaming deve emettere
+    il testo appena il token esiste, e non puo' riusare ``decode([id])``: il
+    BPE e' byte-level, quindi un carattere UTF-8 puo' essere spaccato fra due
+    token e il pezzo finale da solo non e' un carattere valido.
+
+    Il caso reale su questo modello: l'id 248 sono i byte ``\\x9a`` e l'id 222
+    sono ``\\x80``, che insieme all'id precedente formano l'emoji U+1F680.
+    Decodificati uno alla volta diventano due caratteri di sostituzione, e il
+    client stampa ``emoji: <sostituzione><sostituzione>`` al posto del razzo.
+    Non e' un problema di accenti: sono passati, perche' 'e' e 'a' stanno in
+    un token solo. E' un problema dei caratteri da 3 e 4 byte.
+
+    Qui i byte di ogni token passano da un decodificatore incrementale di
+    UTF-8, che trattiene in coda la sequenza incompleta e la completa quando
+    arriva il resto. Quello che esce token per token, concatenato, e' uguale
+    a ``decode(ids)`` sul blocco intero.
+
+    Una differenza rispetto a ``decode``, voluta. ``decode`` stampa il nome
+    letterale dei token di controllo, cosi' un output del modello contiene
+    ``<|think|>``; qui i token non normali non producono nulla, perche' un
+    client non deve mostrare all'utente il nome di un token. Per confrontare
+    le due strade, il blocco va decodificato sui soli token normali.
+    """
+
+    #: token_type 1 in GGUF. Gli altri sono CONTROL (3), USER_DEFINED (4) e
+    #: UNUSED (5): non sono testo, e decodificarli stamperebbe il loro
+    #: nome-letterale, tipo '<|vision_start|>', dentro l'output.
+    NORMAL = 1
+
+    def __init__(self, tokenizer: GGUFTokenizer) -> None:
+        self._tokens = tokenizer.tokens
+        self._types = tokenizer.token_types
+        self._byte_decoder = tokenizer._byte_decoder
+        self._decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def push(self, token_id: int) -> str:
+        """Il testo che questo token rende disponibili subito.
+
+        Puo' essere vuoto: non e' un errore, e' il caso normale quando il
+        token porta solo l'inizio di un carattere multi-byte. Il testo
+        arrivesera' con il token successivo, e non e' andato perso.
+        """
+        if self._types[token_id] != self.NORMAL:
+            return ""
+        piece = self._tokens[token_id]
+        try:
+            raw = bytes(self._byte_decoder[ch] for ch in piece)
+        except KeyError as error:
+            raise KeyError(
+                f"il token {token_id} ({piece!r}) contiene il carattere "
+                f"{error.args[0]!r}, che non e' nella mappa byte-level: "
+                "questo pezzo non e' ricostruibile"
+            ) from error
+        return self._decoder.decode(raw, final=False)
+
+    def push_all(self, ids: list[int]) -> str:
+        return "".join(self.push(token_id) for token_id in ids)
+
+    def flush(self) -> str:
+        """Chiude lo stream: svuota la coda di byte rimasti.
+
+        Se la coda non e' vuota il testo era troncato a meta' carattere.
+        Si solleva un errore invece di stampare un carattere di sostituzione:
+        in uno stream finito male la spazzatura sarebbe indistinguibile da
+        un carattere vero.
+        """
+        return self._decoder.decode(b"", final=True)
+
+    def reset(self) -> None:
+        """Ricomincia da uno stream pulito, per il prompt successivo."""
+        self._decoder.reset()

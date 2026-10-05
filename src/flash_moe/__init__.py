@@ -15,6 +15,7 @@ from .rope import RoPE, DEFAULT_HEAD_DIM, DEFAULT_HEAD_COUNT, DEFAULT_KV_HEAD_CO
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .embedding import EmbeddingLookup, LMHead, argmax_sample, sample
 from .router import ExpertRouter, routers_from_gguf, synthetic_router
+from .tokenizer import GGUFTokenizer, StreamingDetokenizer
 from .backend_ov import OpenVINOExpertBackend
 from .transformer import TransformerBlock
 from .model import Qwen3MoEModel
@@ -69,4 +70,6 @@ __all__ = [
     "sample",
     "TransformerBlock",
     "Qwen3MoEModel",
+    "GGUFTokenizer",
+    "StreamingDetokenizer",
 ]
