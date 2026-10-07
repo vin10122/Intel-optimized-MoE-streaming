@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .key import ExpertKey
 from .store import AsyncExpertStore
+from .mmap_store import MemoryMappedAsyncExpertStore
 from .dequant import dequantize_to, name_of
 from .norm import RMSNorm
 from .rope import RoPE, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
@@ -40,6 +41,7 @@ class Qwen3MoEModel:
         cache_capacity: int = 700,
         dequant_fn: Any = None,
         keep_ssm_f32: bool = False,
+        use_mmap: bool = False,
     ) -> None:
         self.gguv_path = gguf_path
         self.device = device
@@ -124,7 +126,10 @@ class Qwen3MoEModel:
         # Build store + manifest
         from run_q4k_f16_openvino import build_manifest_from_gguf
         self.manifest = build_manifest_from_gguf(gguf_path)
-        self.store = AsyncExpertStore(
+        
+        # Use memory-mapped store for better I/O performance
+        StoreClass = MemoryMappedAsyncExpertStore if use_mmap else AsyncExpertStore
+        self.store = StoreClass(
             gguf_path.parent, capacity=cache_capacity, manifest=self.manifest
         )
 

@@ -75,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "arrivare dal disco. Default 700.")
     parser.add_argument("--max-seq", type=int, default=512,
                         help="lunghezza massima del contesto. Default 512.")
+    parser.add_argument("--preload", action="store_true",
+                        help="Pre-carica tutti gli expert in cache prima della generazione")
+    parser.add_argument("--mmap", action="store_true",
+                        help="Usa memory-mapped I/O per caricamento più veloce")
     return parser
 
 
@@ -145,8 +149,40 @@ def main(argv: list[str] | None = None) -> int:
           f"(cache {args.cache} expert), regge un attimo...", flush=True)
     started = time.perf_counter()
     model = Qwen3MoEModel(path, device=args.device, max_seq_len=args.max_seq,
-                          cache_capacity=args.cache, dequant_fn=dequant_to_f16)
+                          cache_capacity=args.cache, dequant_fn=dequant_to_f16,
+                          use_mmap=args.mmap)
     tok = GGUFTokenizer(gguf.GGUFReader(path))
+    
+    # Pre-caricamento expert se richiesto
+    if args.preload:
+        print(f"Pre-carico {args.cache} expert in cache...", flush=True)
+        preload_start = time.perf_counter()
+        # Preload ALL experts needed for all layers (40 layers * 8 experts)
+        from flash_moe.key import ExpertKey
+        num_experts = model.num_experts
+        experts_per_layer = model.top_k  # Usually 8
+        
+        # Preload all layer expert combinations
+        total_experts_to_load = min(args.cache, 40 * experts_per_layer)
+        experts_loaded = 0
+        
+        for layer in range(40):
+            if experts_loaded >= total_experts_to_load:
+                break
+            for expert_idx in range(experts_per_layer):
+                if experts_loaded >= total_experts_to_load:
+                    break
+                key = ExpertKey(layer, expert_idx % num_experts)
+                model.store.prefetch(key)
+                experts_loaded += 1
+        
+        # Wait for prefetch to complete
+        import time as time_module
+        while len(model.store.pending_loads) > 0:
+            time_module.sleep(0.1)
+        preload_time = time.perf_counter() - preload_start
+        print(f"Pre-caricamento completato in {preload_time:.1f}s. ", flush=True)
+    
     print(f"pronto in {time.perf_counter() - started:.1f} s. "
           "/ esce, vuoto esce.\n", flush=True)
 
