@@ -68,6 +68,15 @@ static inline void gather_and_store_16(
     _mm256_storeu_ps(out + 8, _mm256_mul_ps(_mm256_i32gather_ps(kvalues_iq4_nl, idx1, 4), vscale));
 }
 
+static inline __m128i extract_hi_nibbles(const __m128i qraw) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i lo_words = _mm_unpacklo_epi8(qraw, zero);
+    const __m128i hi_words = _mm_unpackhi_epi8(qraw, zero);
+    const __m128i hi_lo = _mm_srli_epi16(lo_words, 4);
+    const __m128i hi_hi = _mm_srli_epi16(hi_words, 4);
+    return _mm_packus_epi16(hi_lo, hi_hi);
+}
+
 /* ---- Dequantize one IQ4_NL block → 32 floats ---- */
 static inline void dequant_block(const block_iq4_nl* blk, float* __restrict out) {
     const __m256 vscale = _mm256_set1_ps(decode_scale(blk->d));
@@ -79,8 +88,8 @@ static inline void dequant_block(const block_iq4_nl* blk, float* __restrict out)
     const __m128i lo_mask = _mm_set1_epi8(0x0F);
     const __m128i lo8 = _mm_and_si128(qraw, lo_mask);
 
-    /* Extract hi nibbles: (q >> 4) & 0x0F */
-    const __m128i hi8 = _mm_and_si128(_mm_srli_epi16(qraw, 4), lo_mask);
+    /* Extract hi nibbles: (q >> 4) & 0x0F without crossing byte boundaries */
+    const __m128i hi8 = extract_hi_nibbles(qraw);
 
     /* lo nibbles → out[0..15], hi nibbles → out[16..31] */
     gather_and_store_16(lo8, vscale, out);

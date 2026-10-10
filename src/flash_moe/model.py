@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from typing import Any
@@ -42,12 +44,20 @@ class Qwen3MoEModel:
         dequant_fn: Any = None,
         keep_ssm_f32: bool = False,
         use_mmap: bool = False,
+        ssm_device: str | None = None,
     ) -> None:
         self.gguv_path = gguf_path
         self.device = device
         self.max_seq_len = max_seq_len
         self.cache_capacity = cache_capacity
         self._dequant_fn = dequant_fn
+        self.ssm_device = ssm_device
+        self.last_stream_timings: dict[str, int | float] = {
+            "prompt_tokens": 0,
+            "generated_tokens": 0,
+            "prefill_seconds": 0.0,
+            "generation_seconds": 0.0,
+        }
 
         reader = gguf.GGUFReader(gguf_path)
         self.tmap = {t.name: t for t in reader.tensors}
@@ -185,10 +195,9 @@ class Qwen3MoEModel:
             self.blocks[layer].ssm_runner = (
                 lambda x, _lyr=lyr: self._run_ssm(_lyr, x))
         self.ssm_keep_f32 = keep_ssm_f32
-        # Il percorso veloce tiene la copia f32 dei pesi del delta net. Sono
-        # 128.6 MiB per layer, quindi 3.75 GiB per i 30 layer: si accende solo
-        # se la memoria c'e', e va misurato il guadagno prima di renderlo il
-        # default, perche' il prezzo e' il rischio di non entrare in RAM.
+        # keep_ssm_f32 riguarda solo il percorso NumPy/CPU. Con ssm_device
+        # impostato, le tre proiezioni grandi vengono eseguite in f16 su
+        # OpenVINO; la ricorrenza resta in f32 su CPU.
         if keep_ssm_f32:
             for lyr in self.ssm.values():
                 lyr.promote_to_f32()
@@ -250,6 +259,7 @@ class Qwen3MoEModel:
             conv_kernel=self.ssm_conv_kernel,
             weights=weights,
             eps=self.eps,
+            projection_device=self.ssm_device,
         )
 
     def _build_tensor_types(self) -> dict[int, dict[str, int]]:
@@ -478,6 +488,7 @@ class Qwen3MoEModel:
         """
         if not input_ids:
             raise ValueError("input_ids vuoto: niente da cui generare")
+        prefill_started = time.perf_counter()
         self.init_caches()
         rng = np.random.default_rng(seed)
 
@@ -485,8 +496,12 @@ class Qwen3MoEModel:
         x = self.embedding.forward(np.asarray(input_ids, dtype=np.int64))
         x = x.reshape(1, len(input_ids), self.hidden_size)
         x = self._forward_all(x)
+        prefill_seconds = time.perf_counter() - prefill_started
+        generation_seconds = 0.0
+        pending_decode_seconds = 0.0
 
         for produced in range(1, max_new_tokens + 1):
+            step_started = time.perf_counter()
             logits = self.output_norm.forward(x)
             logits = self.lm_head.forward(logits)
             # (1, seq, vocab) -> solo l'ultima posizione: e' li' che si
@@ -500,15 +515,27 @@ class Qwen3MoEModel:
                 top_p=top_p,
                 rng=rng,
             )
+            generation_seconds += (
+                pending_decode_seconds + time.perf_counter() - step_started
+            )
+            pending_decode_seconds = 0.0
+            self.last_stream_timings = {
+                "prompt_tokens": len(input_ids),
+                "generated_tokens": produced,
+                "prefill_seconds": prefill_seconds,
+                "generation_seconds": generation_seconds,
+            }
             yield produced, next_token
-            if next_token == self.eos_token_id:
+            if next_token == self.eos_token_id or produced == max_new_tokens:
                 break
 
             # Decode: un token alla volta, con lo stato dei layer ricorrenti
             # e la cache KV gia' avanti di un passo.
+            step_started = time.perf_counter()
             x = self.embedding.forward(np.asarray([next_token], dtype=np.int64))
             x = x.reshape(1, 1, self.hidden_size)
             x = self._forward_all(x)
+            pending_decode_seconds = time.perf_counter() - step_started
 
     def generate(
         self,

@@ -23,12 +23,53 @@ _ENV_DLL = "FLASH_MOE_DLL"
 DLL_NAME = "fast_dequant_k.dll"
 
 
+def _gguf_candidates() -> list[Path]:
+    """Ritorna i possibili GGUF in ordine di preferenza.
+
+    Se il modello gia' esiste nella cartella del progetto, viene usato senza
+    richiedere un nome file hardcoded; se invece il nome cambia, si cerca in
+    tutto il tree del progetto e si preferiscono i file con quantizzazione Q4_K.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for path in [ROOT / MODEL_FILENAME, *sorted(ROOT.rglob("*.gguf"))]:
+        resolved = path.expanduser().resolve()
+        if resolved.exists() and resolved not in seen:
+            candidates.append(resolved)
+            seen.add(resolved)
+
+    def score(path: Path) -> tuple[int, str]:
+        name = path.name.lower()
+        score = 0
+        if "q4_k" in name:
+            score += 100
+        elif "q4" in name:
+            score += 50
+        if "m" in name and "q4_k" in name:
+            score += 10
+        if path.name == MODEL_FILENAME:
+            score += 20
+        return (score, name)
+
+    return sorted(candidates, key=lambda p: (-score(p)[0], score(p)[1]))
+
+
 def model_path() -> Path:
-    """Percorso del GGUF: variabile d'ambiente, altrimenti il default."""
+    """Percorso del GGUF: override ambiente, poi default storico, poi scan della cartella."""
     override = os.environ.get(_ENV_GGUF)
     if override:
         return Path(override).expanduser().resolve()
-    return ROOT / MODEL_FILENAME
+
+    default_path = ROOT / MODEL_FILENAME
+    if default_path.exists():
+        return default_path
+
+    candidates = _gguf_candidates()
+    if candidates:
+        return candidates[0]
+
+    return default_path
 
 
 def dll_path() -> Path:

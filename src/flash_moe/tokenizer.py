@@ -42,6 +42,8 @@ def _byte_to_unicode() -> dict[int, str]:
 class GGUFTokenizer:
     """Encoder BPE ricostruito dai metadati GGUF."""
 
+    NORMAL = 1
+
     def __init__(self, reader: Any) -> None:
         fields = reader.fields
         self.model = fields["tokenizer.ggml.model"].contents()
@@ -69,9 +71,14 @@ class GGUFTokenizer:
             pairs.append((a, b))
         self._missing = [(a, b) for a, b in pairs if a not in vocab or b not in vocab]
 
-        from tokenizers import Tokenizer, models, pre_tokenizers, decoders
+        from tokenizers import AddedToken, Tokenizer, models, pre_tokenizers, decoders
 
         self._tok = Tokenizer(models.BPE(vocab=vocab, merges=pairs))
+        self._tok.add_special_tokens([
+            AddedToken(token, special=True)
+            for token, token_type in zip(self.tokens, self.token_types)
+            if token_type != self.NORMAL
+        ])
         # Il pre-tokenizer del GGUF e' 'qwen35': lo split regex di GPT-2 con
         # \s+(?!\S)|\s+, che e' quello di ByteLevel.
         self._tok.pre_tokenizer = pre_tokenizers.ByteLevel(
@@ -173,7 +180,7 @@ class StreamingDetokenizer:
     #: token_type 1 in GGUF. Gli altri sono CONTROL (3), USER_DEFINED (4) e
     #: UNUSED (5): non sono testo, e decodificarli stamperebbe il loro
     #: nome-letterale, tipo '<|vision_start|>', dentro l'output.
-    NORMAL = 1
+    NORMAL = GGUFTokenizer.NORMAL
 
     def __init__(self, tokenizer: GGUFTokenizer) -> None:
         self._tokens = tokenizer.tokens

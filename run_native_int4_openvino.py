@@ -1,8 +1,14 @@
 import time
 import ctypes
+import sys
 import numpy as np
 from pathlib import Path
 import gguf
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from flash_moe import (
     ExpertKey,
@@ -14,9 +20,11 @@ from flash_moe import (
     ExpertRouter,
     routers_from_gguf,
 )
+from flash_moe.paths import model_path
 
-# Path corretto: il modello è nella cartella del progetto
-GGUF_FILE_PATH = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_NL.gguf")
+# Il modello va rilevato automaticamente dalla cartella del progetto, con
+# override via FLASH_MOE_GGUF e fallback riall'eventuale .gguf presente.
+GGUF_FILE_PATH = model_path()
 DLL_PATH = Path(r"flash_moe\fast_dequant.dll")
 
 # Caricamento DLL C++ per dequantizzazione accelerata

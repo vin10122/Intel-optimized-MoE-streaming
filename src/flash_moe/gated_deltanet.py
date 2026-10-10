@@ -111,7 +111,8 @@ class GatedDeltaNetLayer:
     def __init__(self, layer_idx: int, weights: dict[str, np.ndarray],
                  hidden_size: int, n_v_heads: int, n_k_heads: int,
                  head_k_dim: int, head_v_dim: int, conv_kernel: int,
-                 eps: float = 1e-6, keep_f32: bool = False) -> None:
+                 eps: float = 1e-6, keep_f32: bool = False,
+                 projection_device: str | None = None) -> None:
         self.layer_idx = layer_idx
         self.w = weights
         self.hidden_size = hidden_size
@@ -125,18 +126,12 @@ class GatedDeltaNetLayer:
         value_dim = head_v_dim * n_v_heads
         self.conv_dim = key_dim * 2 + value_dim
 
-        # I pesi si tengono in f16 (vincolo di memoria sul modello) ma si
-        # calcola in f32: la conversione f16 -> f32 di tutti i pesi di un
-        # layer costa 52 ms, contro 1.6 ms dei matmul veri. Rifarla a ogni
-        # token rendeva due terzi del forward puro spreco.
+        # Il percorso NumPy converte i pesi grandi in f32 a ogni passo, a meno
+        # che keep_f32 mantenga una copia. Con projection_device le proiezioni
+        # grandi restano invece f16 su OpenVINO; la ricorrenza resta f32.
         #
-        # keep_f32=True tiene la copia per sempre: e' la scelta veloce (52 ms
-        # per layer risparmiati a ogni token) ma costa 128.6 MiB per layer,
-        # quindi 3.75 GiB se i 30 layer sono vivi tutti insieme. Con 6 GiB
-        # liberi e 0.95 GiB per embedding e 0.95 per la LM head non ci sta:
-        # la copia si puo' tenere per un singolo layer (per misurare il
-        # guadagno) o per un gruppo piccolo, non per tutti e 30.
-        #
+        # keep_f32=True tiene la copia per sempre: costa 128.6 MiB per layer,
+        # quindi 3.75 GiB se i 30 layer sono vivi tutti insieme.
         # Con keep_f32=False i pesi restano f16 e vengono convertiti a ogni
         # passo. E' il percorso lento ma e' l'unico che entra in memoria, e il
         # suo costo e' il debito di velocita' da pagare: finche' non e'
@@ -151,6 +146,13 @@ class GatedDeltaNetLayer:
                       for k, v in weights.items() if k not in self._big}
         self.big32 = ({k: np.ascontiguousarray(weights[k], dtype=np.float32)
                        for k in self._big} if keep_f32 else None)
+        self.projections = None
+        if projection_device is not None:
+            from .ssm_backend_ov import OpenVINODeltaNetProjections
+
+            self.projections = OpenVINODeltaNetProjections(
+                weights, projection_device
+            )
 
         # ssm_conv1d arriva gia' come (conv_dim, conv_kernel): in
         # ``ggml_compute_forward_ssm_conv_f32`` la riga del canale `ir0`
@@ -206,13 +208,11 @@ class GatedDeltaNetLayer:
         self.conv_state.fill(0.0)
 
     def f32(self, name: str) -> np.ndarray:
-        """Il peso ``name`` in f32, convertito ora se non e' tenuto in copia.
+        """Il peso ``name`` in f32 per le proiezioni NumPy.
 
         La copia permanente esiste solo con ``keep_f32``; altrimenti si
-        converte qui e si lascia che l'allocatore la liberi a fine passo. Il
-        costo e' quello che rende lento il percorso senza copia, ed e'
-        voluto esplicitamente invece che nascosto dietro un default veloce
-        che non entra in memoria.
+        converte qui e si lascia che l'allocatore la liberi a fine passo.
+        Questa funzione non e' usata quando le proiezioni sono su OpenVINO.
         """
         if self.big32 is not None and name in self.big32:
             return self.big32[name]
@@ -231,14 +231,14 @@ class GatedDeltaNetLayer:
         si applicano senza trasporre: sono gia' (n_out, n_in) e basta il
         ``.T`` nel prodotto, che BLAS esegue sulla vista senza copiarla.
 
-        Si usa ``self.w32``, la copia f32 fatta una volta alla costruzione,
-        non ``self.w``: riconvertire i pesi a ogni token costerebbe piu' di
-        tutti i matmul messi insieme. Quando la copia non e' tenuta
-        (``keep_f32=False``) la conversione avviene qui, e questa e' la voce
-        che domina il tempo del forward.
+        Le proiezioni qkv e gate possono essere eseguite da OpenVINO in f16;
+        beta e alpha restano piccoli prodotti NumPy in f32.
         """
-        qkv = x @ self.f32("qkv").T
-        z = x @ self.f32("gate").T
+        if self.projections is None:
+            qkv = x @ self.f32("qkv").T
+            z = x @ self.f32("gate").T
+        else:
+            qkv, z = self.projections.input_projections(x)
         beta = _sigmoid(x @ self.small["beta"].T)
         alpha = x @ self.small["alpha"].T
         return qkv, z, beta, alpha
@@ -379,6 +379,8 @@ class GatedDeltaNetLayer:
         # senza particolarita': il verso giusto e' il trasposto della forma
         # del GGUF, fatto una volta sola in load_layer_weights. Qui il
         # prodotto e' flat @ out.T, che BLAS esegue sulla vista.
+        if self.projections is not None:
+            return self.projections.output_projection(flat)
         return flat @ self.f32("out").T
 
 
@@ -464,4 +466,3 @@ def load_layer_weights(tensor_map: dict, layer: int,
     load("ssm_norm.weight", "norm")
     load("ssm_out.weight", "out")
     return weights
-
