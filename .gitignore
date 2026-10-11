@@ -58,6 +58,8 @@ scratch/
 # Logs
 *.log
 bench_phases_out.txt
+tools/dequant_k_out.txt
+tools/share_weights_out.txt
 # Output dei bisect e dei dump di confronto con llama.cpp: rigenerabili, e il
 # dump pesa qualche megabyte.
 bisect_*_out.txt

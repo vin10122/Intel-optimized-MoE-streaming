@@ -11,7 +11,7 @@ METODO 1: Da Developer Command Prompt (consigliato)
 1. Apri: "Start Menu" -> "Developer Command Prompt for VS 2022"
 
 2. Vai nella cartella del progetto:
-   cd C:\Users\valer\Desktop\moe-client-prot\Nuova cartella
+   cd /d "PERCORSO_DEL_PROGETTO"
 
 3. Compila la DLL:
    cl /EHsc /O2 /arch:AVX2 /openmp /LD scratch\fast_dequant_q8_0.cpp /link /OUT:flash_moe\fast_dequant_q8_0.dll /DLL /MACHINE:x64

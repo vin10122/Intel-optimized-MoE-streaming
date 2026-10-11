@@ -1,125 +1,158 @@
 # FLASH-MOE
 
-Inferenza MoE ibrida lineare-attention/MoE su **Intel Arc 130V** (Xe2 LPG, integrata) via OpenVINO.
+**Prototipo per eseguire un modello linguistico MoE in locale su hardware
+Intel, usando OpenVINO.**
 
-Il modello di riferimento è un GGUF `qwen35moe` da 16,24 GiB, più grande della
-RAM di sistema: l'intero approccio è **streaming degli expert** — in RAM stanno
-i pesi non-expert e gli 8 expert attivi del layer corrente, il resto viene
-letto dal GGUF su richiesta.
+Il progetto sperimenta come distribuire il lavoro tra processore e grafica
+integrata, caricando dal disco solo una parte dei pesi del modello alla volta.
+L'obiettivo e' capire fin dove si puo' arrivare con un PC comune, senza
+richiedere una scheda grafica dedicata con molta memoria.
 
-## Stato
+> **Stato: in sviluppo.** Il programma genera gia' risposte a prompt reali,
+> ma velocita', qualita' delle risposte e stabilita' vanno ancora verificate
+> meglio. Aspettati tempi lunghi, cambiamenti e possibili problemi.
 
-| Componente | Stato |
-|---|---|
-| Dequantizzazione K-quant in C++ (Q8_0, Q3_K, Q4_K, Q5_K, Q6_K) | **validato**, gate 162/162 |
-| Precisione OpenVINO: `float16` nativo su porte a 16 bit | **validato** |
-| Slicing degli expert dal GGUF | letto e offset verificati |
-| **Inferenza end-to-end** (OpenVINO vs NumPy) | **non ancora validata** |
-| `AsyncExpertStore` / `build_manifest_from_gguf` | mai esercitati |
+## In breve
 
-Il gate numerico copre i kernel e la precisione, **non** l'inference. Nessun
-token è stato ancora generato e validato end-to-end.
+- Legge un modello in formato GGUF e permette di fargli domande da PowerShell.
+- Usa OpenVINO per eseguire i calcoli su CPU o su un dispositivo Intel
+  supportato.
+- Il modello e' di tipo **MoE** (*Mixture of Experts*): a ogni passo usa solo
+  alcuni dei suoi gruppi di pesi, chiamati *expert*, invece di attivarli tutti.
+- L'interfaccia mostra separatamente il tempo necessario per leggere il
+  prompt e quello impiegato per generare la risposta.
 
-## Modello
+## Stato e risultati
 
-```
-Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf
-architettura  qwen35moe      40 layer      hidden 2048
-expert        256 (8 attivi/token)         intermediate 512
-```
+Il primo modello provato e' **Hermes 3.6 35B A3B**, una variante Qwen3.5-MoE
+in formato GGUF. Il file del modello non e' incluso nel repository: e' molto
+grande e va ottenuto separatamente.
 
-Il percorso del modello vive in un solo posto: `src/flash_moe/paths.py`.
-Per puntare a un altro GGUF senza toccare il codice:
+La prima prova manuale su un **Intel Core Ultra 5 226V con grafica integrata
+Intel Arc 130V** ha generato risposte comprensibili. Nei prompt provati la
+velocita' e' variata da circa **0,2 a 0,8 token al secondo**. Sono misure
+indicative, non un benchmark controllato: cambiano con la domanda, la
+lunghezza della risposta e lo stato della cache.
+
+Le prove automatiche controllano separatamente componenti come attenzione,
+dequantizzazione e percorso DeltaNet. Non equivalgono a una validazione
+completa della qualita' delle risposte o dell'affidabilita' su ogni PC.
+
+## Requisiti
+
+- Windows 10 o 11 a 64 bit.
+- Python 3.14 e i pacchetti elencati in `requirements.txt`. Python 3.14.7 e'
+  la versione usata nelle prove; altre versioni potrebbero funzionare, ma non
+  sono state verificate con la stessa configurazione.
+- Un file GGUF compatibile. Il modello usato nelle prove e' indicato sopra.
+- Driver Intel aggiornati se vuoi usare la grafica integrata.
+
+Per installare i pacchetti da PowerShell, nella cartella del progetto:
 
 ```powershell
-$env:FLASH_MOE_GGUF = "D:\modelli\altro.gguf"
+py -3.14 -m pip install -r requirements.txt
 ```
 
-## Struttura
+Se il comando `py` non e' disponibile, usa `python` al suo posto.
 
-```
-cpp/                          kernel C++ K-quant
-  dequant_k.cpp                 dequant_k, dequant_k_supported, dequant_k_block_size
-  dequant_k_tables.h            generato: mappature ql/qh misurate
-src/flash_moe/                 unica copia del pacchetto
-  paths.py                      modello e DLL, con override via env
-  dequant.py                    dequantizzazione GGUF (f32 / f16)
-  store.py  router.py  engine.py  backend_ov.py
-src/run_q4k_f16_openvino.py   runner expert singolo, SwiGLU in float16
-tools/
-  test_dequant_k.py             il gate numerico (162/162)
-  derive_k_tables.py            misura le mappature di interlacciamento
-  test_phase1.py                dimostra che la vecchia DLL era errata
-scripts/compile_dequant_k.bat  build MSVC della DLL
-docs/PHASE0_FINDINGS.md         rilievi di Fase 0
+## Preparare il modello
+
+Se il file GGUF si trova nella cartella del progetto, il programma prova a
+trovarlo automaticamente. Altrimenti indica il suo percorso prima di avviare
+la chat:
+
+```powershell
+$env:FLASH_MOE_GGUF = "D:\modelli\modello.gguf"
 ```
 
-## Costruire la DLL
+Il progetto **non distribuisce il modello**. Scaricalo da una fonte
+autorizzata e controlla le condizioni d'uso previste dal suo autore: la
+licenza del modello e quella del codice sono separate.
+
+## Avviare una conversazione
+
+```powershell
+py -3.14 chat.py --device GPU --ssm-device GPU --attention-device GPU --cache 320 --weight-cache 384 --max-tokens 256 --temp 0
+```
+
+La chat chiede un prompt dopo il simbolo `>`. Per uscire, scrivi `/esce` o
+premi `Ctrl+C`.
+
+Il comando seleziona la GPU Intel anche per alcune operazioni interne. Se il
+driver o il dispositivo non sono disponibili, prova a omettere le opzioni
+`--ssm-device GPU` e `--attention-device GPU`, oppure usa `--device CPU`.
+
+L'assistente riceve un'istruzione per rispondere in modo conciso. `--max-tokens`
+e' un **limite massimo**, non la lunghezza obbligatoria: la generazione
+termina prima se il modello emette il segnale di fine risposta. Se invece
+raggiunge il limite, la risposta puo' restare incompleta; in quel caso
+aumentalo, per esempio con `--max-tokens 384`.
+
+Al termine di ogni risposta vengono mostrati i token generati al secondo, il
+tempo di lettura del prompt e alcune statistiche della cache. Il caricamento
+iniziale puo' richiedere parecchio tempo.
+
+### Opzioni utili
+
+- `--device CPU`, `GPU` o `NPU`: sceglie il dispositivo principale di
+  OpenVINO. La disponibilita' dipende da hardware e driver.
+- `--max-tokens 256`: stabilisce il massimo di token generabili per risposta.
+- `--cache 320`: limita quanti gruppi di pesi quantizzati tenere in memoria.
+- `--weight-cache 384`: limita quanti gruppi di pesi gia' convertiti tenere
+  in memoria. Ridurre il valore puo' aiutare se il PC e' a corto di RAM.
+- `--temp 0`: usa una scelta deterministica dei token; valori maggiori
+  introducono piu' variabilita'.
+- `--max-seq 512`: imposta la lunghezza massima gestita per il contesto.
+
+## Accelerazione della conversione dei pesi
+
+Su Windows e' possibile compilare il modulo C++ usato per convertire alcuni
+formati di pesi:
 
 ```powershell
 scripts\compile_dequant_k.bat
 ```
 
-Produce `src/flash_moe/fast_dequant_k.dll` (AVX2 + F16C). La DLL non è nel
-repository: si ricostruisce.
+Serve Visual Studio Build Tools con il compilatore C++ x64. Il file generato
+non e' incluso nel repository. Se non e' presente, il programma usa il
+percorso alternativo basato sui pacchetti Python: puo' essere piu' lento, ma
+non richiede la DLL.
 
-## Verificare
+## Eseguire alcune verifiche
+
+I test sono script Python; dalla cartella principale si possono lanciare, ad
+esempio, cosi':
 
 ```powershell
-python tools\test_dequant_k.py
+py -3.14 tools\test_attention.py
+py -3.14 tools\test_gated_deltanet_real.py
 ```
 
-Confronta ogni kernel contro `gguf.quants` — la stessa reference di llama.cpp —
-bit per bit sul primo blocco e con tolleranza `1e-6` sull'intero, su blocchi
-sintetici e su 12 tensori reali del GGUF. Attesi **162 passati, 0 falliti**.
+Alcuni test richiedono il modello GGUF configurato e possono durare a lungo.
+Il secondo test usa il modello configurato; esegui prima i passaggi della
+sezione precedente. Queste verifiche controllano singoli componenti e non
+sostituiscono una prova completa della chat.
 
-## Tre errori che è costato imparare
+Gli script di confronto con i dump di `llama.cpp` cercano per impostazione
+predefinita `lcpp_eval.txt` nella cartella del progetto. Per usare un dump
+altrove, imposta `FLASH_MOE_LCPP_EVAL` al suo percorso prima di avviare lo
+script.
 
-Sono qui perché sono tutti non ovvi e tutti hanno prodotto numeri plausibili
-invece che errori evidenti.
+## Limiti attuali
 
-**1. `astype(np.uint16)` sui pesi dequantizzati produce una matrice di zeri.**
-I pesi di un expert valgono circa `0..0,0855`, quindi troncarli a intero dà
-tutto zero. Non è un'approssimazione grossolana: sono pesi nulli. Il cast
-corretto è reinterpretare i bit in `float16`.
+- Per ora e' stato provato soprattutto un singolo PC Intel; altri hardware
+  possono avere prestazioni o compatibilita' diverse.
+- La generazione e' lenta rispetto ai servizi online e ai sistemi con GPU
+  dedicata.
+- Le prestazioni dipendono molto dall'accesso al file del modello e dalla
+  memoria disponibile.
+- Le istruzioni di risposta concisa aiutano a limitare la lunghezza, ma il
+  comportamento resta deciso dal modello; il tetto di token puo' comunque
+  interrompere una risposta lunga.
+- Non e' ancora un'applicazione pronta per un uso produttivo.
 
-**2. `bf16` non funziona su questa piattaforma.** Passare `numpy.uint16` su
-porte a 16 bit produce `NaN`. Il metodo che regge è `numpy.float16` nativo su
-`ov.Type.f16` (vedi `tools/check_ov_precisions.py`).
+## Licenza
 
-**3. Lo stesso ruolo expert non ha sempre lo stesso tipo quantizzato.**
-`ffn_gate_exps` e `ffn_up_exps` sono `Q4_K`, ma `ffn_down_exps` è `Q8_0`.
-Dequantizzarli tutti con lo stesso tipo non dà errore, dà pesi sbagliati. I
-tipi vanno letti dal GGUF.
-
-## Formato Q8_0 corretto
-
-La documentazione precedente riportava `8 scale float16 + 256 int8 = 272 B` e
-`y = (qs - 128) * scale`. **Entrambe le cose sono sbagliate** ed erano il
-formato della DLL rotta. Il layout reale:
-
-```
-34 byte per blocco di 32 elementi
-  offset 0   : f16 d
-  offset 2   : int8 qs[32]
-  y[i] = qs[i] * d
-```
-
-Non c'è `dmin` e non c'è l'offset `-128`. Lo stesso vale per Q3_K, che non ha
-`dmin` e ha `d` a offset 108.
-
-## Prestazioni attese
-
-Per token si leggono ~1,66 miliardi di parametri attivi (992M expert + 671M
-attenzione) in `float16`, cioè ~3,33 GB. Con ~140 GB/s di banda il pavimento è
-~24 ms/token. A cache expert fredda il collo di bottiglia diventa l'NVMe:
-~734 MB/token, ~105 ms con Gen4. Entrambi i regimi sono usabili, quindi la
-cache non è bloccante per partire.
-
-Nessuna misura end-to-end è stata ancora presa: sono stime based sui numeri
-sopra, non risultati.
-
-## Note
-
-Le DLL in `.gitignore` e il GGUF non sono versionati. `run_q8_0_bf16_openvino.py`
-è stato rimosso: puntava a un modello diverso e alla DLL errata.
+Al momento il repository non contiene un file di licenza. Finche' non verra'
+aggiunto, non dare per scontato di avere il permesso di riutilizzare o
+ridistribuire il codice.

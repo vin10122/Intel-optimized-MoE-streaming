@@ -12,13 +12,14 @@ tappa della catena del delta net e per ognuna delle 5 posizioni del prompt.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import gguf  # noqa: E402
@@ -29,7 +30,7 @@ from flash_moe.paths import model_path  # noqa: E402
 from flash_moe.tokenizer import GGUFTokenizer  # noqa: E402
 
 PROMPT = "La capital of France is"
-LCPP = Path(r"C:\Users\valer\AppData\Local\Temp\kilo\lcpp_eval.txt")
+LCPP = Path(os.environ.get("FLASH_MOE_LCPP_EVAL", ROOT / "lcpp_eval.txt")).expanduser()
 NUM = re.compile(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?")
 TENSOR = re.compile(r"^\s*common_debug_cb_eval:\s+(\S+) = \(f32\)")
 

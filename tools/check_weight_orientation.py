@@ -13,13 +13,14 @@ llama.cpp ha stampato, e si vede quale coincide.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import gguf  # noqa: E402
@@ -63,7 +64,7 @@ emb = EmbeddingLookup.from_gguf_tensor(tmap["token_embd.weight"])
 x = emb.forward(np.asarray(ids, dtype=np.int64)).reshape(1, len(ids), -1)
 normed = RMSNorm(norm_w, eps=1e-6).forward(x)[0]
 
-LCPP = Path(r"C:\Users\valer\AppData\Local\Temp\kilo\lcpp_eval.txt")
+LCPP = Path(os.environ.get("FLASH_MOE_LCPP_EVAL", ROOT / "lcpp_eval.txt")).expanduser()
 NUM = re.compile(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?")
 TENSOR = re.compile(r"^\s*common_debug_cb_eval:\s+(\S+) = \(f32\)")
 
@@ -97,4 +98,3 @@ for label, w in varianti.items():
     print(f"  llama.cpp     : {np.array2string(np.asarray(llcpp[:3]), precision=4)}")
     err = float(np.abs(qkv[:3] - np.asarray(llcpp[:3])).max())
     print(f"  errore assoluto sui primi tre: {err:.6f}")
-

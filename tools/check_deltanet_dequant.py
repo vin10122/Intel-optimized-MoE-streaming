@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella")
+ROOT = Path(__file__).resolve().parents[1]
 
 # La console di Windows e' cp1252 e non sa scrivere i caratteri che questo
 # test usa nelle etichette: senza questo muore su un accento invece di dire

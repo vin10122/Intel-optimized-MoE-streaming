@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(r"C:\Users\valer\Desktop\moe-client-prot\Nuova cartella")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import gguf  # noqa: E402
