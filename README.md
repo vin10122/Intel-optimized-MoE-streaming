@@ -1,4 +1,4 @@
-# FLASH-MOE
+# INTEL-OPTIMIZED-MOE
 
 **An experimental project for running MoE language models locally on Intel
 hardware with OpenVINO.**
