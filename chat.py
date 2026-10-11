@@ -55,8 +55,14 @@ from flash_moe.tokenizer import GGUFTokenizer  # noqa: E402
 
 
 def encode_user_turn(tok: GGUFTokenizer, prompt: str) -> list[int]:
-    """Codifica una domanda col formato chat del template GGUF."""
+    """Codifica una domanda con l'istruzione di risposta concisa."""
     formatted = (
+        "<|im_start|>system\n"
+        "Rispondi nella lingua dell'utente. Sii diretto e conciso: dai la "
+        "risposta essenziale senza premesse o ripetizioni. Per domande "
+        "semplici bastano una o poche frasi; aggiungi dettagli solo se "
+        "servono a rispondere correttamente. Concludi appena hai risposto."
+        "<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n"
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
@@ -80,8 +86,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-device", choices=("CPU", "GPU", "NPU"),
                         help="dispositivo OpenVINO per le proiezioni full "
                              "attention FP16. Default: NumPy su CPU.")
-    parser.add_argument("--max-tokens", type=int, default=64,
-                        help="token massimi da generare. Default 64.")
+    parser.add_argument("--max-tokens", type=int, default=256,
+                        help="token massimi da generare. Default 256.")
     parser.add_argument("--temp", type=float, default=0.7,
                         help="temperatura del campionamento. 0 = greedy. "
                              "Default 0.7.")
@@ -107,12 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def footer(model: Qwen3MoEModel, eos: bool) -> str:
+def footer(model: Qwen3MoEModel, eos: bool, token_limit_reached: bool) -> str:
     """Statistiche di I/O e cache per il turno."""
     stats = model.store.stats
     bits = []
     if eos:
-        bits.append("fine perite")
+        bits.append("EOS")
+    elif token_limit_reached:
+        bits.append("limite token raggiunto")
     bits.append(f"{stats.bytes_read / 2**20:.0f} MiB letti dal disco")
     bits.append(f"{stats.misses} cache miss, {stats.prefetch_hits} prefetch")
     bits.append(f"{len(model.store.resident_keys())} expert in RAM")
@@ -166,7 +174,7 @@ def ask(model: Qwen3MoEModel, tok: GGUFTokenizer, prompt: str,
         f"generazione: {n} token in {generation_seconds:.1f} s "
         f"({tok_s:.3f} tok/s; prefill escluso)"
     )
-    print(f"{footer(model, eos)}\n")
+    print(f"{footer(model, eos, n >= args.max_tokens and not eos)}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -175,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--cache deve essere positivo")
     if args.weight_cache is not None and args.weight_cache < 1:
         raise ValueError("--weight-cache deve essere positivo")
+    if args.max_tokens < 1:
+        raise ValueError("--max-tokens deve essere positivo")
     if args.temp <= 0.0:
         # greedy: senza top_k e top_p che scatterebbero il risultato
         args.top_k, args.top_p = 0, 0.0
