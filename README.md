@@ -69,6 +69,25 @@ Il progetto **non distribuisce il modello**. Scaricalo da una fonte
 autorizzata e controlla le condizioni d'uso previste dal suo autore: la
 licenza del modello e quella del codice sono separate.
 
+### Fonte e attribuzione del modello provato
+
+La corrispondenza pubblica piu' vicina al nome del file usato nei test e'
+[`LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-GGUF`](https://huggingface.co/LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-GGUF).
+La scheda descrive un modello basato su
+[`HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive`](https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive),
+con un contributo Hermes attribuito a
+[`DJLougen`](https://huggingface.co/DJLougen/hermes-qwen3.5-35b-a3b-GGUF).
+Le schede di LuffyTheFox e della base HauhauCS dichiarano Apache-2.0 per i
+rispettivi repository.
+
+Il file presente nei test si chiama
+`Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf`, mentre nel
+repository LuffyTheFox la variante corrispondente e' elencata senza `Final`
+nel nome. La corrispondenza e' quindi probabile, ma non conferma da sola che
+si tratti della stessa revisione o degli stessi pesi. Il modello e' escluso
+dal repository del progetto; per usarlo o ridistribuirlo, verifica sempre la
+fonte e i termini associati al file effettivamente scaricato.
+
 ## Avviare una conversazione
 
 ```powershell
@@ -151,8 +170,8 @@ script.
   interrompere una risposta lunga.
 - Non e' ancora un'applicazione pronta per un uso produttivo.
 
-## Licenza
+## Licenza del codice
 
-Al momento il repository non contiene un file di licenza. Finche' non verra'
-aggiunto, non dare per scontato di avere il permesso di riutilizzare o
-ridistribuire il codice.
+Il codice di questo repository e' distribuito con licenza
+[Apache-2.0](./LICENSE). Questa licenza riguarda il codice del progetto, non
+i pesi o i dati dei modelli esterni.
