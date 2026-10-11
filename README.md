@@ -1,177 +1,182 @@
 # FLASH-MOE
 
-**Prototipo per eseguire un modello linguistico MoE in locale su hardware
-Intel, usando OpenVINO.**
+**An experimental project for running MoE language models locally on Intel
+hardware with OpenVINO.**
 
-Il progetto sperimenta come distribuire il lavoro tra processore e grafica
-integrata, caricando dal disco solo una parte dei pesi del modello alla volta.
-L'obiettivo e' capire fin dove si puo' arrivare con un PC comune, senza
-richiedere una scheda grafica dedicata con molta memoria.
+This project explores splitting inference work between the CPU and integrated
+graphics, while loading only some of the model weights from disk at a time.
+The goal is to explore what may be possible on a regular PC without a
+high-memory discrete graphics card.
 
-> **Stato: in sviluppo.** Il programma genera gia' risposte a prompt reali,
-> ma velocita', qualita' delle risposte e stabilita' vanno ancora verificate
-> meglio. Aspettati tempi lunghi, cambiamenti e possibili problemi.
+> **Status: work in progress.** The program has generated answers to real
+> prompts, but speed, answer quality, and stability still need more testing.
+> Expect long wait times, changes, and possible issues.
 
-## In breve
+## Inspiration
 
-- Legge un modello in formato GGUF e permette di fargli domande da PowerShell.
-- Usa OpenVINO per eseguire i calcoli su CPU o su un dispositivo Intel
-  supportato.
-- Il modello e' di tipo **MoE** (*Mixture of Experts*): a ogni passo usa solo
-  alcuni dei suoi gruppi di pesi, chiamati *expert*, invece di attivarli tutti.
-- L'interfaccia mostra separatamente il tempo necessario per leggere il
-  prompt e quello impiegato per generare la risposta.
+This project was inspired by Apple's **Flash-MoE** app, as seen in
+[this Instagram Reel](https://www.instagram.com/reel/DdqjqtAxAk6/). It is an
+independent software project and is not affiliated with, endorsed by, or
+sponsored by Apple.
 
-## Stato e risultati
+## At a glance
 
-Il primo modello provato e' **Hermes 3.6 35B A3B**, una variante Qwen3.5-MoE
-in formato GGUF. Il file del modello non e' incluso nel repository: e' molto
-grande e va ottenuto separatamente.
+- Reads models in GGUF format and lets you chat with them from PowerShell.
+- Uses OpenVINO to run calculations on the CPU or a supported Intel device.
+- The model uses a **Mixture of Experts (MoE)** architecture: for each step,
+  it activates only some groups of model weights, called *experts*, rather
+  than all of them.
+- The command-line interface reports prompt processing time and generation
+  speed separately.
 
-La prima prova manuale su un **Intel Core Ultra 5 226V con grafica integrata
-Intel Arc 130V** ha generato risposte comprensibili. Nei prompt provati la
-velocita' e' variata da circa **0,2 a 0,8 token al secondo**. Sono misure
-indicative, non un benchmark controllato: cambiano con la domanda, la
-lunghezza della risposta e lo stato della cache.
+## Status and results
 
-Le prove automatiche controllano separatamente componenti come attenzione,
-dequantizzazione e percorso DeltaNet. Non equivalgono a una validazione
-completa della qualita' delle risposte o dell'affidabilita' su ogni PC.
+The first model tested was **Hermes 3.6 35B A3B**, a Qwen3.6-MoE-based model
+in GGUF format. The model file is not included in this repository; you need
+to obtain it separately.
 
-## Requisiti
+An initial manual test on an **Intel Core Ultra 5 226V with integrated Intel
+Arc 130V graphics** produced understandable answers. Across the prompts
+tested, generation speed ranged from about **0.2 to 0.8 tokens per second**.
+These are indicative results, not a controlled benchmark: performance varies
+with the prompt, answer length, and cache state.
 
-- Windows 10 o 11 a 64 bit.
-- Python 3.14 e i pacchetti elencati in `requirements.txt`. Python 3.14.7 e'
-  la versione usata nelle prove; altre versioni potrebbero funzionare, ma non
-  sono state verificate con la stessa configurazione.
-- Un file GGUF compatibile. Il modello usato nelle prove e' indicato sopra.
-- Driver Intel aggiornati se vuoi usare la grafica integrata.
+Automated tests check individual components such as attention,
+dequantization, and the DeltaNet path. They are not a full validation of
+answer quality or reliability across different PCs.
 
-Per installare i pacchetti da PowerShell, nella cartella del progetto:
+## Requirements
+
+- 64-bit Windows 10 or 11.
+- Python 3.14 and the packages listed in `requirements.txt`. The tests used
+  Python 3.14.7; other versions may work, but have not been checked with the
+  same setup.
+- A compatible GGUF model file. The model used in testing is described
+  below.
+- Up-to-date Intel drivers if you want to use integrated graphics.
+
+From PowerShell, in the project directory, install the dependencies with:
 
 ```powershell
 py -3.14 -m pip install -r requirements.txt
 ```
 
-Se il comando `py` non e' disponibile, usa `python` al suo posto.
+If the `py` command is not available, use `python` instead.
 
-## Preparare il modello
+## Set up the model
 
-Se il file GGUF si trova nella cartella del progetto, il programma prova a
-trovarlo automaticamente. Altrimenti indica il suo percorso prima di avviare
-la chat:
+If the GGUF file is in the project directory, the program will try to find it
+automatically. Otherwise, set its path before starting the chat:
 
 ```powershell
-$env:FLASH_MOE_GGUF = "D:\modelli\modello.gguf"
+$env:FLASH_MOE_GGUF = "D:\models\model.gguf"
 ```
 
-Il progetto **non distribuisce il modello**. Scaricalo da una fonte
-autorizzata e controlla le condizioni d'uso previste dal suo autore: la
-licenza del modello e quella del codice sono separate.
+This project **does not distribute the model**. Obtain it from an authorized
+source and check the terms provided by its author. The model's license and
+the code's license are separate.
 
-### Fonte e attribuzione del modello provato
+### Source and attribution for the tested model
 
-La corrispondenza pubblica piu' vicina al nome del file usato nei test e'
+The closest public match to the filename used in testing is
 [`LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-GGUF`](https://huggingface.co/LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-GGUF).
-La scheda descrive un modello basato su
+Its model card describes it as based on
 [`HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive`](https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive),
-con un contributo Hermes attribuito a
+with a Hermes contribution attributed to
 [`DJLougen`](https://huggingface.co/DJLougen/hermes-qwen3.5-35b-a3b-GGUF).
-Le schede di LuffyTheFox e della base HauhauCS dichiarano Apache-2.0 per i
-rispettivi repository.
+The LuffyTheFox and HauhauCS model cards declare Apache-2.0 for their
+respective repositories.
 
-Il file presente nei test si chiama
-`Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf`, mentre nel
-repository LuffyTheFox la variante corrispondente e' elencata senza `Final`
-nel nome. La corrispondenza e' quindi probabile, ma non conferma da sola che
-si tratti della stessa revisione o degli stessi pesi. Il modello e' escluso
-dal repository del progetto; per usarlo o ridistribuirlo, verifica sempre la
-fonte e i termini associati al file effettivamente scaricato.
+The file used in testing is named
+`Hermes3.6-35B-A3B-Uncensored-Genesis-Final-APEX-Compact.gguf`, while the
+corresponding variant listed in the LuffyTheFox repository omits `Final`
+from its name. The match is likely, but this alone does not confirm that
+both files are the same revision or contain the same weights. The model is
+excluded from this project repository; before using or redistributing it,
+verify the source and terms for the exact file you obtained.
 
-## Avviare una conversazione
+## Start a chat
 
 ```powershell
 py -3.14 chat.py --device GPU --ssm-device GPU --attention-device GPU --cache 320 --weight-cache 384 --max-tokens 256 --temp 0
 ```
 
-La chat chiede un prompt dopo il simbolo `>`. Per uscire, scrivi `/esce` o
-premi `Ctrl+C`.
+Enter a prompt after the `>` symbol. To exit, type `/esce` or press
+`Ctrl+C`.
 
-Il comando seleziona la GPU Intel anche per alcune operazioni interne. Se il
-driver o il dispositivo non sono disponibili, prova a omettere le opzioni
-`--ssm-device GPU` e `--attention-device GPU`, oppure usa `--device CPU`.
+This command selects the Intel GPU for some internal operations as well. If
+the driver or device is unavailable, try omitting `--ssm-device GPU` and
+`--attention-device GPU`, or use `--device CPU`.
 
-L'assistente riceve un'istruzione per rispondere in modo conciso. `--max-tokens`
-e' un **limite massimo**, non la lunghezza obbligatoria: la generazione
-termina prima se il modello emette il segnale di fine risposta. Se invece
-raggiunge il limite, la risposta puo' restare incompleta; in quel caso
-aumentalo, per esempio con `--max-tokens 384`.
+The assistant is instructed to keep its answers concise. `--max-tokens` is
+a **maximum limit**, not a required answer length: generation stops earlier
+if the model emits its end-of-response token. If it reaches the limit, the
+answer may be incomplete; in that case, raise the limit, for example with
+`--max-tokens 384`.
 
-Al termine di ogni risposta vengono mostrati i token generati al secondo, il
-tempo di lettura del prompt e alcune statistiche della cache. Il caricamento
-iniziale puo' richiedere parecchio tempo.
+After each answer, the program reports generated tokens per second, prompt
+processing time, and some cache statistics. Initial model loading may take
+a long time.
 
-### Opzioni utili
+### Useful options
 
-- `--device CPU`, `GPU` o `NPU`: sceglie il dispositivo principale di
-  OpenVINO. La disponibilita' dipende da hardware e driver.
-- `--max-tokens 256`: stabilisce il massimo di token generabili per risposta.
-- `--cache 320`: limita quanti gruppi di pesi quantizzati tenere in memoria.
-- `--weight-cache 384`: limita quanti gruppi di pesi gia' convertiti tenere
-  in memoria. Ridurre il valore puo' aiutare se il PC e' a corto di RAM.
-- `--temp 0`: usa una scelta deterministica dei token; valori maggiori
-  introducono piu' variabilita'.
-- `--max-seq 512`: imposta la lunghezza massima gestita per il contesto.
+- `--device CPU`, `GPU`, or `NPU`: selects the main OpenVINO device.
+  Availability depends on your hardware and drivers.
+- `--max-tokens 256`: sets the maximum number of tokens to generate per
+  answer.
+- `--cache 320`: limits how many quantized expert weight groups to keep in
+  memory.
+- `--weight-cache 384`: limits how many converted expert weight groups to
+  keep in memory. Lowering this value may help if the PC is short on RAM.
+- `--temp 0`: uses deterministic token selection; higher values introduce
+  more variation.
+- `--max-seq 512`: sets the maximum supported context length.
 
-## Accelerazione della conversione dei pesi
+## Optional C++ weight-conversion acceleration
 
-Su Windows e' possibile compilare il modulo C++ usato per convertire alcuni
-formati di pesi:
+On Windows, you can compile the C++ module used to convert some weight
+formats:
 
 ```powershell
 scripts\compile_dequant_k.bat
 ```
 
-Serve Visual Studio Build Tools con il compilatore C++ x64. Il file generato
-non e' incluso nel repository. Se non e' presente, il programma usa il
-percorso alternativo basato sui pacchetti Python: puo' essere piu' lento, ma
-non richiede la DLL.
+This requires Visual Studio Build Tools with the x64 C++ compiler. The
+generated file is not included in the repository. If the DLL is unavailable,
+the program uses a Python-based fallback, which may be slower but does not
+require the DLL.
 
-## Eseguire alcune verifiche
+## Run some checks
 
-I test sono script Python; dalla cartella principale si possono lanciare, ad
-esempio, cosi':
+Tests are Python scripts. For example, run these from the project root:
 
 ```powershell
 py -3.14 tools\test_attention.py
 py -3.14 tools\test_gated_deltanet_real.py
 ```
 
-Alcuni test richiedono il modello GGUF configurato e possono durare a lungo.
-Il secondo test usa il modello configurato; esegui prima i passaggi della
-sezione precedente. Queste verifiche controllano singoli componenti e non
-sostituiscono una prova completa della chat.
+Some tests require the configured GGUF model and may take a long time. The
+second test uses the configured model; set it up as described above first.
+These checks cover individual components and do not replace a full chat
+test.
 
-Gli script di confronto con i dump di `llama.cpp` cercano per impostazione
-predefinita `lcpp_eval.txt` nella cartella del progetto. Per usare un dump
-altrove, imposta `FLASH_MOE_LCPP_EVAL` al suo percorso prima di avviare lo
-script.
+Scripts that compare results with `llama.cpp` dumps look for
+`lcpp_eval.txt` in the project directory by default. To use a dump elsewhere,
+set `FLASH_MOE_LCPP_EVAL` to its path before running the script.
 
-## Limiti attuali
+## Current limitations
 
-- Per ora e' stato provato soprattutto un singolo PC Intel; altri hardware
-  possono avere prestazioni o compatibilita' diverse.
-- La generazione e' lenta rispetto ai servizi online e ai sistemi con GPU
-  dedicata.
-- Le prestazioni dipendono molto dall'accesso al file del modello e dalla
-  memoria disponibile.
-- Le istruzioni di risposta concisa aiutano a limitare la lunghezza, ma il
-  comportamento resta deciso dal modello; il tetto di token puo' comunque
-  interrompere una risposta lunga.
-- Non e' ancora un'applicazione pronta per un uso produttivo.
+- Testing has mainly been done on one Intel PC; performance and compatibility
+  may differ on other hardware.
+- Generation is slow compared with online services and systems with a
+  discrete GPU.
+- Performance depends heavily on model-file access and available memory.
+- The concise-answer instruction can help limit answer length, but the
+  model's behavior varies; the token limit can still cut off a long answer.
+- This is not yet ready for production use.
 
-## Licenza del codice
+## Code license
 
-Il codice di questo repository e' distribuito con licenza
-[Apache-2.0](./LICENSE). Questa licenza riguarda il codice del progetto, non
-i pesi o i dati dei modelli esterni.
+The code in this repository is distributed under the
+[Apache-2.0 license](./LICENSE). This license applies to the project code,
+not to external model weights or data.
