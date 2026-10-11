@@ -30,15 +30,22 @@ class Qwen3MoELazyModel(Qwen3MoEModel):
         gguf_path: Path,
         device: str = "GPU",
         max_seq_len: int = 2048,
-        cache_capacity: int = 700,
+        cache_capacity: int = 320,
         dequant_fn: Any = None,
         keep_ssm_f32: bool = False,
         use_mmap: bool = True,
+        attention_device: str | None = None,
+        weight_cache_capacity: int | None = None,
     ) -> None:
         # Call parent __init__ but we'll override blocks/ssm
         # Set use_mmap to control store class
         self._lazy_loading = True
         self._use_mmap = use_mmap
+        self.attention_device = attention_device
+        self.weight_cache_capacity = (
+            cache_capacity if weight_cache_capacity is None
+            else weight_cache_capacity
+        )
 
         # Initialize basic attributes first
         import gguf
@@ -114,7 +121,7 @@ class Qwen3MoELazyModel(Qwen3MoEModel):
             self.store,
             device=device,
             weight_dtype="f16",
-            cache_capacity=cache_capacity,
+            cache_capacity=self.weight_cache_capacity,
             tensor_types=self.tensor_types,
             dequant_fn=dequant_fn,
         )
@@ -219,6 +226,7 @@ class Qwen3MoELazyModel(Qwen3MoEModel):
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
                 shared_expert=self.shared_expert,
+                attention_device=self.attention_device,
             )
 
     def _build_ssm(self, layer: int):

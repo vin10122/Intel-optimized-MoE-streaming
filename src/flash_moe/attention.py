@@ -66,6 +66,8 @@ corrispondenti.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .norm import RMSNorm
@@ -219,6 +221,7 @@ def grouped_attention(
     v: np.ndarray,
     n_tokens: int,
     seq_offset: int,
+    timings: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Attenzione causale con GQA, batch 1.
 
@@ -238,6 +241,7 @@ def grouped_attention(
         raise ValueError(f"n_head ({n_head}) deve essere multiplo di n_kv ({n_kv})")
     group = n_head // n_kv
 
+    started = time.perf_counter() if timings is not None else 0.0
     # La cache e' f16: score e softmax in f32, perche' in f16 einsum e' anche
     # molto piu' lento e la somma su head_dim=256 perderebbe i contributi.
     qf = np.asarray(q, dtype=np.float32)
@@ -247,7 +251,13 @@ def grouped_attention(
     if group > 1:
         kf = np.repeat(kf, group, axis=1)
         vf = np.repeat(vf, group, axis=1)
+    if timings is not None:
+        timings["attention_cast_and_gqa"] = (
+            timings.get("attention_cast_and_gqa", 0.0)
+            + time.perf_counter() - started
+        )
 
+    started = time.perf_counter() if timings is not None else 0.0
     scores = np.einsum("qhd,khd->qhk", qf, kf) * (1.0 / np.sqrt(head_dim))
 
     # Maschera causale: il token alla posizione assoluta seq_offset + q puo'
@@ -261,12 +271,28 @@ def grouped_attention(
     mask = k_pos[None, :] > q_pos[:, None]
     if mask.any():
         scores = np.where(mask[:, None, :], -np.inf, scores)
+    if timings is not None:
+        timings["attention_scores_and_mask"] = (
+            timings.get("attention_scores_and_mask", 0.0)
+            + time.perf_counter() - started
+        )
 
+    started = time.perf_counter() if timings is not None else 0.0
     scores -= scores.max(axis=-1, keepdims=True)
     e = np.exp(scores)
     p = e / e.sum(axis=-1, keepdims=True)
+    if timings is not None:
+        timings["attention_softmax"] = (
+            timings.get("attention_softmax", 0.0)
+            + time.perf_counter() - started
+        )
 
+    started = time.perf_counter() if timings is not None else 0.0
     out = np.einsum("qhk,khd->qhd", p, vf)
+    if timings is not None:
+        timings["attention_values"] = (
+            timings.get("attention_values", 0.0) + time.perf_counter() - started
+        )
     return out.reshape(n_tokens, n_head * head_dim)
 
 
@@ -326,6 +352,8 @@ class AttentionLayer:
         # attention.scale, andrebbe letto da li' invece che derivato.
         self.scale = 1.0 / float(np.sqrt(head_dim))
         self._cache: KVCache | None = None
+        self.profile_timings: dict[str, float] | None = None
+        self.projection_backend = None
 
     # ---------------------------------------------------------------- cache
 
@@ -409,13 +437,23 @@ class AttentionLayer:
                 f"x di forma {x.shape}, attesa (n_tokens, {self.hidden_size})")
         n_tokens = x.shape[0]
         seq_offset = cache.seq_len if cache is not None else 0
+        timings = self.profile_timings
 
         # --- proiezioni, senza trasporre: i pesi sono in convenzione ggml
-        q_full = x @ weights["q"]            # (T, n_head * 2 * head_dim)
-        k_full = x @ weights["k"]            # (T, n_kv * head_dim)
-        v_full = x @ weights["v"]
+        started = time.perf_counter() if timings is not None else 0.0
+        if self.projection_backend is None:
+            q_full = x @ weights["q"]        # (T, n_head * 2 * head_dim)
+            k_full = x @ weights["k"]        # (T, n_kv * head_dim)
+            v_full = x @ weights["v"]
+        else:
+            q_full, k_full, v_full = self.projection_backend.input_projections(x)
+        if timings is not None:
+            timings["projections"] = (
+                timings.get("projections", 0.0) + time.perf_counter() - started
+            )
 
         # --- Q e gate sono interleaved per testa: [query | gate] per head.
+        started = time.perf_counter() if timings is not None else 0.0
         # Non e' una divisione a meta' sull'asse delle feature.
         qg = q_full.reshape(n_tokens, self.num_heads, 2, self.head_dim)
         q = qg[:, :, 0, :]                  # (T, n_head, head_dim)
@@ -427,8 +465,14 @@ class AttentionLayer:
         # --- QK-norm su head_dim, prima del RoPE (qwen35moe.cpp:305,311)
         q = self._qk_norm(q, weights["q_norm"])
         k = self._qk_norm(k, weights["k_norm"])
+        if timings is not None:
+            timings["qk_norm_and_reshape"] = (
+                timings.get("qk_norm_and_reshape", 0.0)
+                + time.perf_counter() - started
+            )
 
         # --- RoPE su q e k. V non ruotata.
+        started = time.perf_counter() if timings is not None else 0.0
         # rope.apply prende (..., n_pos, head_dim): la posizione e' l'ultimo
         # asse, quindi q e k (n_tokens, n_head, head_dim) vanno passati come
         # (n_head, n_tokens, head_dim) e poi tornati a token per primo.
@@ -438,11 +482,17 @@ class AttentionLayer:
         k = np.ascontiguousarray(
             self.rope_k.apply(np.transpose(k, (1, 0, 2)), seq_offset=seq_offset))
         k = np.ascontiguousarray(np.transpose(k, (1, 0, 2)))
+        if timings is not None:
+            timings["rope_and_layout"] = (
+                timings.get("rope_and_layout", 0.0)
+                + time.perf_counter() - started
+            )
 
         # --- K e V per l'attenzione: (n_kv_tokens, n_kv_head, head_dim).
         # k e v sono gia' in quest'ordine: trasporli qui produrrebbe
         # (n_kv_head, n_kv_tokens, head_dim) e far leggere a grouped_attention
         # il numero di token come numero di teste.
+        started = time.perf_counter() if timings is not None else 0.0
         if cache is not None:
             cache.append(np.ascontiguousarray(k),
                          np.ascontiguousarray(v))
@@ -451,14 +501,34 @@ class AttentionLayer:
         else:
             kk = np.ascontiguousarray(k)
             vv = np.ascontiguousarray(v)
+        if timings is not None:
+            timings["kv_cache"] = (
+                timings.get("kv_cache", 0.0) + time.perf_counter() - started
+            )
 
-        out = grouped_attention(q, kk, vv, n_tokens, seq_offset)
+        started = time.perf_counter() if timings is not None else 0.0
+        out = grouped_attention(q, kk, vv, n_tokens, seq_offset, timings)
+        if timings is not None:
+            timings["grouped_attention"] = (
+                timings.get("grouped_attention", 0.0)
+                + time.perf_counter() - started
+            )
 
         # --- gate sigmoid, non silu (qwen35moe.cpp:347-350)
+        started = time.perf_counter() if timings is not None else 0.0
         out = out * _sigmoid(gate.reshape(n_tokens, -1))
 
         # --- proiezione di uscita: attn_output e' (n_head*head_dim, hidden)
-        return out @ weights["out"]
+        if self.projection_backend is None:
+            result = out @ weights["out"]
+        else:
+            result = self.projection_backend.output_projection(out)
+        if timings is not None:
+            timings["gate_and_output_projection"] = (
+                timings.get("gate_and_output_projection", 0.0)
+                + time.perf_counter() - started
+            )
+        return result
 
     def _qk_norm(self, x: np.ndarray, weight: np.ndarray) -> np.ndarray:
         """RMSNorm su head_dim, per ogni token e ogni testa.

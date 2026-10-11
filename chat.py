@@ -8,14 +8,15 @@ a uno, che e' il punto di tutto il progetto.
 
     python chat.py                        # conversazione
     python chat.py "Che cos'e' un MoE?"     # domanda singola in chat format
-    python chat.py --cache 1 "..."        # con un solo expert in RAM
+    python chat.py --cache 1 --weight-cache 1 "..."  # cache minima
 
-Su ``--cache``. Il default tiene 700 expert in RAM, e con un prompt di una
-frase non si arriva a riempirli: la cache non viene mai interrogata, e il
-disco sembra non servire. Con ``--cache 1`` ogni expert arriva dal GGUF e
-ogni token rilegge tutto: e' piu' lento ed e' il modo di vedere davvero da
-dove viene il peso. Il resto del runtime e' identico, e l'output e' lo stesso,
-perche' la cache non cambia i numeri: cambia solo quante volte si rilegge.
+Su ``--cache`` e ``--weight-cache``. La prima tiene in RAM i byte quantizzati
+letti dal GGUF; la seconda i pesi f16 già convertiti. I default sono 320 raw
+e 384 convertiti: il test ha ridotto i miss di conversione da 777 a 623 su
+quattro passi, mentre 448 non li ha ridotti ulteriormente. 640 pesi convertiti
+hanno causato paging in prove precedenti. Per disabilitare entrambe le cache
+imposta entrambi i parametri a 1. Le cache non cambiano i numeri, solo quante
+volte si rileggono o riconvertono i pesi.
 
 Su ``--device``. Il default e' CPU. GPU e NPU sono selezionabili, ma le
 misure end-to-end dipendono da memoria disponibile, cache e dispositivo.
@@ -23,6 +24,9 @@ misure end-to-end dipendono da memoria disponibile, cache e dispositivo.
 Su ``--ssm-device``. Sposta le proiezioni grandi del DeltaNet su OpenVINO
 CPU/GPU/NPU in f16; ricorrenza e stato restano in f32 su CPU. Senza opzione
 il percorso resta NumPy/CPU.
+
+Su ``--attention-device``. Sposta le proiezioni Q/K/V e output della full
+attention su OpenVINO FP16. Senza opzione il percorso resta NumPy/CPU.
 """
 from __future__ import annotations
 
@@ -73,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ssm-device", choices=("CPU", "GPU", "NPU"),
                         help="dispositivo OpenVINO per le proiezioni DeltaNet. "
                              "Default: NumPy su CPU.")
+    parser.add_argument("--attention-device", choices=("CPU", "GPU", "NPU"),
+                        help="dispositivo OpenVINO per le proiezioni full "
+                             "attention FP16. Default: NumPy su CPU.")
     parser.add_argument("--max-tokens", type=int, default=64,
                         help="token massimi da generare. Default 64.")
     parser.add_argument("--temp", type=float, default=0.7,
@@ -84,9 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="massa cumulativa del nucleo. Default 0.95.")
     parser.add_argument("--seed", type=int, default=42,
                         help="seme del campionamento. Default 42.")
-    parser.add_argument("--cache", type=int, default=700,
-                        help="expert tenuti in RAM. 1 per vedere ogni peso "
-                             "arrivare dal disco. Default 700.")
+    parser.add_argument("--cache", type=int, default=320,
+                        help="expert grezzi quantizzati tenuti in RAM. "
+                             "Default 320.")
+    parser.add_argument("--weight-cache", type=int,
+                        help="pesi expert convertiti tenuti in RAM; "
+                             "default 384. Imposta 1 insieme a --cache 1 "
+                             "per riconvertire ogni volta.")
     parser.add_argument("--max-seq", type=int, default=512,
                         help="lunghezza massima del contesto. Default 512.")
     parser.add_argument("--preload", action="store_true",
@@ -160,6 +171,10 @@ def ask(model: Qwen3MoEModel, tok: GGUFTokenizer, prompt: str,
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cache < 1:
+        raise ValueError("--cache deve essere positivo")
+    if args.weight_cache is not None and args.weight_cache < 1:
+        raise ValueError("--weight-cache deve essere positivo")
     if args.temp <= 0.0:
         # greedy: senza top_k e top_p che scatterebbero il risultato
         args.top_k, args.top_p = 0, 0.0
@@ -171,12 +186,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"carico {path.name} su {args.device} "
-          f"(cache {args.cache} expert; DeltaNet "
-          f"{args.ssm_device or 'NumPy/CPU'}), regge un attimo...", flush=True)
+          f"(cache raw {args.cache}, pesi convertiti "
+          f"{args.weight_cache or 384}; DeltaNet "
+          f"{args.ssm_device or 'NumPy/CPU'}; full attention "
+          f"{args.attention_device or 'NumPy/CPU'}), regge un attimo...",
+          flush=True)
     started = time.perf_counter()
     model = Qwen3MoEModel(path, device=args.device, max_seq_len=args.max_seq,
                           cache_capacity=args.cache, dequant_fn=dequant_to_f16,
+                          weight_cache_capacity=args.weight_cache or 384,
                           ssm_device=args.ssm_device,
+                          attention_device=args.attention_device,
                           use_mmap=args.mmap)
     tok = GGUFTokenizer(gguf.GGUFReader(path))
     

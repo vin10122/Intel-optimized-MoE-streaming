@@ -50,6 +50,7 @@ class TransformerBlock:
         shared_expert: Any = None,
         is_ssm: bool = False,
         ssm_runner: Any = None,
+        attention_device: str | None = None,
     ) -> None:
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -101,6 +102,8 @@ class TransformerBlock:
         self.q_k_norm = q_k_norm
         self.k_k_norm = k_k_norm
         self._prepared_weights: dict[str, np.ndarray] | None = None
+        self.attention_device = attention_device
+        self._attention_backend = None
         if q_k_norm is not None and k_k_norm is not None:
             self.q_norm = RMSNorm(q_k_norm, eps=1e-6)
             self.k_norm = RMSNorm(k_k_norm, eps=1e-6)
@@ -132,6 +135,13 @@ class TransformerBlock:
                 np.ascontiguousarray(self.attn_output_weight.T),
                 keep_f16=True,
             )
+            if self.attention_device is not None:
+                from .attention_backend_ov import OpenVINOAttentionProjections
+
+                self._attention_backend = OpenVINOAttentionProjections(
+                    self._prepared_weights, self.attention_device
+                )
+                self.attn.projection_backend = self._attention_backend
         return self._prepared_weights
 
     def _attention_forward(self, x: np.ndarray, seq_offset: int = 0) -> np.ndarray:

@@ -33,6 +33,7 @@ Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precision
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -87,11 +88,16 @@ class OpenVINOExpertBackend:
         self.tensor_types = tensor_types or {}
         self._dequant_fn = dequant_fn
         self.cache_capacity = cache_capacity
+        if self.cache_capacity < 0:
+            raise ValueError(
+                f"cache_capacity must be >= 0, got {self.cache_capacity}"
+            )
 
         self._compiled_models: dict[tuple[int, int], Any] = {}
         self._requests: dict[tuple[int, int], Any] = {}
-        self._weight_cache: dict[ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        self._weight_order: list[ExpertKey] = []
+        self._weight_cache: OrderedDict[
+            ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]
+        ] = OrderedDict()
         # Buffer f16 riciclati, indicizzati per numero di elementi: un expert
         # ha tensori di due grandezze diverse (hidden x inter e inter x hidden).
         # Senza questo pool ogni dequant chiede pagine nuove al sistema operativo
@@ -151,8 +157,7 @@ class OpenVINOExpertBackend:
                  intermediate_size: int):
         cached = self._weight_cache.get(key)
         if cached is not None:
-            self._weight_order.remove(key)
-            self._weight_order.append(key)
+            self._weight_cache.move_to_end(key)
             return cached
 
         # gate/up stanno in memoria come (n_ff, n_hidden) e down come
@@ -172,10 +177,9 @@ class OpenVINOExpertBackend:
 
         weights = (gate, up, down)
         self._weight_cache[key] = weights
-        self._weight_order.append(key)
-        if self.cache_capacity and len(self._weight_order) > self.cache_capacity:
-            oldest = self._weight_order.pop(0)
-            self._release(self._weight_cache.pop(oldest, None))
+        if self.cache_capacity and len(self._weight_cache) > self.cache_capacity:
+            _, oldest_weights = self._weight_cache.popitem(last=False)
+            self._release(oldest_weights)
         return weights
 
     def _release(self, weights) -> None:
@@ -245,7 +249,6 @@ class OpenVINOExpertBackend:
 
     def clear_cache(self) -> None:
         self._weight_cache.clear()
-        self._weight_order.clear()
         for slot in self._pool.values():
             slot.clear()
 

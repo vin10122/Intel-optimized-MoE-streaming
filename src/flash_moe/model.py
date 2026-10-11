@@ -40,18 +40,25 @@ class Qwen3MoEModel:
         gguf_path: Path,
         device: str = "GPU",
         max_seq_len: int = 2048,
-        cache_capacity: int = 700,
+        cache_capacity: int = 320,
         dequant_fn: Any = None,
         keep_ssm_f32: bool = False,
         use_mmap: bool = False,
         ssm_device: str | None = None,
+        attention_device: str | None = None,
+        weight_cache_capacity: int | None = None,
     ) -> None:
         self.gguv_path = gguf_path
         self.device = device
         self.max_seq_len = max_seq_len
         self.cache_capacity = cache_capacity
+        self.weight_cache_capacity = (
+            cache_capacity if weight_cache_capacity is None
+            else weight_cache_capacity
+        )
         self._dequant_fn = dequant_fn
         self.ssm_device = ssm_device
+        self.attention_device = attention_device
         self.last_stream_timings: dict[str, int | float] = {
             "prompt_tokens": 0,
             "generated_tokens": 0,
@@ -148,7 +155,7 @@ class Qwen3MoEModel:
             self.store,
             device=device,
             weight_dtype="f16",
-            cache_capacity=cache_capacity,
+            cache_capacity=self.weight_cache_capacity,
             tensor_types=self.tensor_types,
             dequant_fn=dequant_fn,
         )
@@ -409,6 +416,7 @@ class Qwen3MoEModel:
                 intermediate_size=self.intermediate_size,
                 num_experts=self.num_experts,
                 shared_expert=self.shared_expert,
+                attention_device=self.attention_device,
             )
 
     def _run_ssm(self, layer: GatedDeltaNetLayer, x: np.ndarray) -> np.ndarray:
