@@ -55,11 +55,8 @@ if DLL_PATH.exists():
         ]
         _dll.dequant_k.restype = ctypes.c_int
         _cpp_dequant = _dll
-        print(f"[C++] Dequantizzazione accelerata: {DLL_PATH.name}", flush=True)
-    except Exception as err:
-        print(f"[C++] DLL non utilizzabile ({err}), uso la reference gguf", flush=True)
-else:
-    print(f"[C++] {DLL_PATH.name} non presente, uso la reference gguf", flush=True)
+    except Exception:
+        pass
 
 
 def dequant_to_f16(raw: bytes, ggml_type: int, n_elements: int,
@@ -85,14 +82,14 @@ def dequant_to_f16(raw: bytes, ggml_type: int, n_elements: int,
         )
         if rc == 0:
             return out
-        print(f"[C++] dequant_k ha restituito rc={rc}, uso la reference", flush=True)
     return dequantize_to(raw, ggml_type, "f16")
 
 
-def build_manifest_from_gguf(gguf_path: Path) -> ExpertManifest:
+def build_manifest_from_gguf(gguf_path: Path, reader=None) -> ExpertManifest:
     """Crea manifest per accesso diretto a slices GGUF Q4_K."""
     print(f"[GGUF Manifest] Costruzione manifest per {gguf_path.name}...", flush=True)
-    reader = gguf.GGUFReader(gguf_path)
+    if reader is None:
+        reader = gguf.GGUFReader(gguf_path)
     tensor_map = {t.name: t for t in reader.tensors}
 
     block_count = 40

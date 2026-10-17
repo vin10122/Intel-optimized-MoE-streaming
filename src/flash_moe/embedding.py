@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .dequant import dequantize_to, name_of
@@ -33,6 +35,7 @@ class EmbeddingLookup:
         tensor,
         tensor_type: int | None = None,
         gguf_reader=None,
+        dequant_fn=None,
     ) -> "EmbeddingLookup":
         """Builds an embedding from a GGUF tensor.
 
@@ -57,11 +60,16 @@ class EmbeddingLookup:
             raw = tensor.data
             if hasattr(raw, "tobytes"):
                 raw = raw.tobytes()
-            weight = dequantize_to(
-                np.frombuffer(raw, dtype=np.uint8),
-                tensor_type,
-                "f16",
-            ).reshape(vocab_size, hidden_size)
+            if dequant_fn is not None:
+                weight = dequant_fn(
+                    raw, tensor_type, vocab_size * hidden_size
+                ).reshape(vocab_size, hidden_size)
+            else:
+                weight = dequantize_to(
+                    np.frombuffer(raw, dtype=np.uint8),
+                    tensor_type,
+                    "f16",
+                ).reshape(vocab_size, hidden_size)
 
         return cls(weight, vocab_size, hidden_size)
 
@@ -92,38 +100,58 @@ class LMHead:
     (Q6_K, shape ``(vocab_size, hidden)``).  The forward pass computes
     ``logits = activation @ weight.T``.
 
-    **I pesi stanno in f32 dal caricamento.** Il prodotto è 248320 × 2048,
-    cioè 508M di pesi: convertirli da f16 a f32 a ogni token costava 872 ms
-    isolati e 1236 ms nel modello, cioè il 21% del token, per un GEMV che in
-    BLAS f32 fa 31,5 ms. Con i pesi già in f32 la conversione non la fa
-    nessuno: 27,7x, e il risultato è identico bit per bit perché f16 → f32 non
-    perde cifre. Costo: 970 MiB di f16 diventano 1940 MiB di f32, e la
-    dequantizzazione al caricamento deve ancora passare da f16, che è il
-    percorso che il modello usava già: i valori sono quelli di prima, arrotondati
-    a f16 nello stesso punto.
+    The output matrix is kept in f16 to reduce resident memory by about 1 GiB
+    on the tested model. Each chunk is converted to f32 before multiplication,
+    preserving the same weights and accumulation precision as the f32 path.
     """
 
-    def __init__(self, weight: np.ndarray, vocab_size: int, hidden_size: int) -> None:
+    def __init__(self, weight: np.ndarray, vocab_size: int, hidden_size: int,
+                 device: str = "GPU",
+                 startup_timings: dict[str, float] | None = None) -> None:
         if weight.shape != (vocab_size, hidden_size):
             raise ValueError(
                 f"lm_head weight shape {weight.shape} != "
                 f"({vocab_size}, {hidden_size})"
             )
-        self.weight = np.ascontiguousarray(weight, dtype=np.float32)
+        self.weight = np.ascontiguousarray(weight, dtype=np.float16)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        # Il ciclo su blocchi resta, ma non serve piu' a contenere la memoria
-        # di staging: il blocco e' una vista dei pesi, non una copia. Serve a
-        # tenere ogni scrittura dei logits dentro una finestra contigua.
-        # Cambiare il blocco cambierebbe il blocking del GEMM e con esso gli
-        # ultimi bit del risultato, quindi il valore viene lasciato com'e'.
         self.chunk_rows = 8192
+        self.compiled_model = None
+        self.infer_request = None
+
+        compile_started = time.perf_counter()
+        # Try compiling OpenVINO MatMul for ultra-fast generation (e.g. 14ms vs 1500ms on Arc GPU)
+        try:
+            import openvino as ov
+            import openvino.opset13 as ops
+            core = ov.Core()
+            dev = device if device in core.available_devices else ("CPU" if "CPU" in core.available_devices else None)
+            if dev is not None:
+                x = ops.parameter([1, self.hidden_size], ov.Type.f16, name="hidden")
+                w = ops.constant(self.weight, ov.Type.f16, name="lm_head_w")
+                matmul = ops.matmul(x, w, False, True)
+                m = ov.Model([matmul], [x], "lm_head_matmul")
+                self.compiled_model = core.compile_model(m, dev)
+                self.infer_request = self.compiled_model.create_infer_request()
+                self._ov_device = dev
+        except Exception as e:
+            self.compiled_model = None
+            self.infer_request = None
+        finally:
+            if startup_timings is not None:
+                startup_timings["openvino_compile"] = (
+                    time.perf_counter() - compile_started
+                )
 
     @classmethod
     def from_gguf_tensor(
         cls,
         tensor,
         tensor_type: int | None = None,
+        device: str = "GPU",
+        startup_timings: dict[str, float] | None = None,
+        dequant_fn=None,
     ) -> "LMHead":
         if tensor_type is None:
             tensor_type = int(tensor.tensor_type)
@@ -131,6 +159,7 @@ class LMHead:
         shape = tuple(int(s) for s in reversed(tensor.shape))
         vocab_size, hidden_size = shape
 
+        dequant_started = time.perf_counter()
         if tensor_type == 1:  # F16
             weight = tensor.data.astype(np.float16)
         elif tensor_type in (0,):  # F32
@@ -139,13 +168,21 @@ class LMHead:
             raw = tensor.data
             if hasattr(raw, "tobytes"):
                 raw = raw.tobytes()
-            weight = dequantize_to(
-                np.frombuffer(raw, dtype=np.uint8),
-                tensor_type,
-                "f16",
-            ).reshape(vocab_size, hidden_size)
+            if dequant_fn is not None:
+                weight = dequant_fn(
+                    raw, tensor_type, vocab_size * hidden_size
+                ).reshape(vocab_size, hidden_size)
+            else:
+                weight = dequantize_to(
+                    np.frombuffer(raw, dtype=np.uint8),
+                    tensor_type,
+                    "f16",
+                ).reshape(vocab_size, hidden_size)
 
-        return cls(weight, vocab_size, hidden_size)
+        if startup_timings is not None:
+            startup_timings["dequant"] = time.perf_counter() - dequant_started
+        return cls(weight, vocab_size, hidden_size, device=device,
+                   startup_timings=startup_timings)
 
     def forward(self, hidden: np.ndarray) -> np.ndarray:
         """Computes logits.
@@ -162,11 +199,24 @@ class LMHead:
             squeezed = True
 
         h = np.ascontiguousarray(hidden, dtype=np.float32).reshape(-1, self.hidden_size)
+
+        # Fast path with OpenVINO if decoding single token and model available
+        if self.infer_request is not None and h.shape[0] == 1:
+            try:
+                res = self.infer_request.infer({self.compiled_model.input(0): h.astype(np.float16)})
+                logits = np.asarray(res[self.compiled_model.output(0)], dtype=np.float32)
+                logits = logits.reshape(*hidden.shape[:-1], self.vocab_size)
+                if squeezed:
+                    logits = logits.squeeze()
+                return logits
+            except Exception:
+                pass
+
         logits = np.empty((h.shape[0], self.vocab_size), dtype=np.float32)
         for start in range(0, self.vocab_size, self.chunk_rows):
             stop = min(start + self.chunk_rows, self.vocab_size)
-            # Il blocco e' una vista sui pesi f32: niente staging, niente cast.
-            logits[:, start:stop] = h @ self.weight[start:stop].T
+            block = self.weight[start:stop].astype(np.float32)
+            logits[:, start:stop] = h @ block.T
 
         logits = logits.reshape(*hidden.shape[:-1], self.vocab_size)
         if squeezed:

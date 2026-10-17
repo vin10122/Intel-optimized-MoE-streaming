@@ -7,7 +7,7 @@ setlocal
 set SCRIPT_DIR=%~dp0
 set ROOT=%SCRIPT_DIR%..
 set OUT_DIR=%ROOT%\src\flash_moe
-set OUT_DLL=%OUT_DIR%\fast_dequant_k.dll
+set OUT_DLL=%OUT_DIR%\fast_dequant_k_parallel.dll
 
 if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
 

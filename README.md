@@ -35,11 +35,12 @@ The first model tested was **Hermes 3.6 35B A3B**, a Qwen3.6-MoE-based model
 in GGUF format. The model file is not included in this repository; you need
 to obtain it separately.
 
-An initial manual test on an **Intel Core Ultra 5 226V with integrated Intel
-Arc 130V graphics** produced understandable answers. Across the prompts
-tested, generation speed ranged from about **0.2 to 0.8 tokens per second**.
-These are indicative results, not a controlled benchmark: performance varies
-with the prompt, answer length, and cache state.
+Manual end-to-end runs on an **Intel Core Ultra 5 226V with integrated Intel
+Arc 130V graphics** produced understandable answers. In three recent runs,
+generation measured **1.081, 1.231, and 1.304 tokens per second**. The prompts
+contained 91, 91, and 86 tokens; their prefill times were **55.1, 42.0, and
+40.9 seconds**, respectively. These are indicative results, not a controlled
+benchmark: performance varies with the prompt, answer length, and cache state.
 
 Automated tests check individual components such as attention,
 dequantization, and the DeltaNet path. They are not a full validation of
@@ -98,21 +99,25 @@ verify the source and terms for the exact file you obtained.
 ## Start a chat
 
 ```powershell
-py -3.14 chat.py --device GPU --ssm-device GPU --attention-device GPU --cache 320 --weight-cache 384 --max-tokens 256 --temp 0
+py -3.14 chat.py default
 ```
 
 Enter a prompt after the `>` symbol. To exit, type `/esce` or press
 `Ctrl+C`.
 
-This command selects the Intel GPU for some internal operations as well. If
-the driver or device is unavailable, try omitting `--ssm-device GPU` and
-`--attention-device GPU`, or use `--device CPU`.
+The preset runs the main model on the CPU and uses the Intel GPU for DeltaNet
+projections and full attention. If the GPU or its driver is unavailable, use
+`--ssm-device CPU --attention-device CPU` instead.
+
+The `default` preset selects CPU for the main device, GPU for DeltaNet and
+full-attention projections, cache sizes of 320 and 384, deterministic
+sampling, and a 512-token maximum. Append a prompt after `default` for a
+one-shot run.
 
 The assistant is instructed to keep its answers concise. `--max-tokens` is
 a **maximum limit**, not a required answer length: generation stops earlier
 if the model emits its end-of-response token. If it reaches the limit, the
-answer may be incomplete; in that case, raise the limit, for example with
-`--max-tokens 384`.
+answer may be incomplete; in that case, raise the limit further.
 
 After each answer, the program reports generated tokens per second, prompt
 processing time, and some cache statistics. Initial model loading may take
@@ -122,7 +127,7 @@ a long time.
 
 - `--device CPU`, `GPU`, or `NPU`: selects the main OpenVINO device.
   Availability depends on your hardware and drivers.
-- `--max-tokens 256`: sets the maximum number of tokens to generate per
+- `--max-tokens 512`: sets the maximum number of tokens to generate per
   answer.
 - `--cache 320`: limits how many quantized expert weight groups to keep in
   memory.

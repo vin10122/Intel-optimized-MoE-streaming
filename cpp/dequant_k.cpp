@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
+#include <ppl.h>
 
 /* Mappature misurate da tools/derive_k_tables.py, non derivate a mano. */
 #include "dequant_k_tables.h"
@@ -320,6 +321,24 @@ static int bytes_per_block(int type) {
     }
 }
 
+static bool dequant_f16_chunk(int type, const uint8_t* src, uint16_t* dst,
+                              int64_t done, int64_t n_now, int bs, int pb) {
+    constexpr int64_t CHUNK = 8192;  /* 32 KiB: buffer temporaneo per task */
+    alignas(32) float tmp[CHUNK];
+    const int64_t b_now = n_now / bs;
+    const uint8_t* chunk_src = src + done / bs * pb;
+    switch (type) {
+        case GGML_TYPE_Q8_0: dequant_q8_0(chunk_src, tmp, b_now); break;
+        case GGML_TYPE_Q3_K: dequant_q3_k(chunk_src, tmp, b_now); break;
+        case GGML_TYPE_Q4_K: dequant_q4_k(chunk_src, tmp, b_now); break;
+        case GGML_TYPE_Q5_K: dequant_q5_k(chunk_src, tmp, b_now); break;
+        case GGML_TYPE_Q6_K: dequant_q6_k(chunk_src, tmp, b_now); break;
+        default: return false;
+    }
+    cvt_f32_to_f16(tmp, dst + done, n_now);
+    return true;
+}
+
 extern "C" __declspec(dllexport) int dequant_k_supported(int type) {
     return block_size_of(type) != 0;
 }
@@ -354,26 +373,22 @@ extern "C" __declspec(dllexport) int dequant_k(int type, const uint8_t* src,
        ciclo di scrittura+conversione dominate il tempo: era il 94% del costo
        dell'expert. Lo stesso risultato in bit: la conversione e' indipendente
        per blocco. */
-    const int64_t CHUNK = 8192;                 /* elementi per passata */
-    float* tmp = (float*)std::malloc((size_t)CHUNK * sizeof(float));
-    if (tmp == nullptr) return -1;
-
+    constexpr int64_t CHUNK = 8192;              /* elementi per passata */
     uint16_t* o16 = (uint16_t*)dst;
-    int64_t done = 0;
-    while (done < n) {
-        const int64_t n_now = (n - done < CHUNK) ? (n - done) : CHUNK;
-        const int64_t b_now = n_now / bs;       /* n e' multiplo di bs */
-        switch (type) {
-            case GGML_TYPE_Q8_0: dequant_q8_0(src + done / bs * pb, tmp, b_now); break;
-            case GGML_TYPE_Q3_K: dequant_q3_k(src + done / bs * pb, tmp, b_now); break;
-            case GGML_TYPE_Q4_K: dequant_q4_k(src + done / bs * pb, tmp, b_now); break;
-            case GGML_TYPE_Q5_K: dequant_q5_k(src + done / bs * pb, tmp, b_now); break;
-            case GGML_TYPE_Q6_K: dequant_q6_k(src + done / bs * pb, tmp, b_now); break;
-            default: std::free(tmp); return -1;
+    const int64_t n_chunks = (n + CHUNK - 1) / CHUNK;
+    if (n_chunks < 4) {
+        for (int64_t chunk = 0; chunk < n_chunks; ++chunk) {
+            const int64_t done = chunk * CHUNK;
+            const int64_t n_now = (n - done < CHUNK) ? (n - done) : CHUNK;
+            if (!dequant_f16_chunk(type, src, o16, done, n_now, bs, pb))
+                return -1;
         }
-        cvt_f32_to_f16(tmp, o16 + done, n_now);
-        done += n_now;
+    } else {
+        Concurrency::parallel_for<int64_t>(0, n_chunks, [&](int64_t chunk) {
+            const int64_t done = chunk * CHUNK;
+            const int64_t n_now = (n - done < CHUNK) ? (n - done) : CHUNK;
+            dequant_f16_chunk(type, src, o16, done, n_now, bs, pb);
+        });
     }
-    std::free(tmp);
     return 0;
 }

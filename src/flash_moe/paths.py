@@ -19,8 +19,9 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 _ENV_GGUF = "FLASH_MOE_GGUF"
 _ENV_DLL = "FLASH_MOE_DLL"
 
-# L'unica dequantizzazione validata: tools/test_dequant_k.py (gate 162/162).
-DLL_NAME = "fast_dequant_k.dll"
+# Kernel K-quant validato con tools/test_dequant_k.py; la nuova DLL conserva
+# gli stessi kernel e parallelizza solo chunk indipendenti dell'output f16.
+DLL_NAME = "fast_dequant_k_parallel.dll"
 
 
 def _gguf_candidates() -> list[Path]:

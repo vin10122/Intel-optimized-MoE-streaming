@@ -40,7 +40,6 @@ class MemoryMappedGGUF:
         """Open and memory-map the file."""
         with self._lock:
             if self._mapping is not None:
-                self._refcount += 1
                 return
             
             self._file = open(self.path, "rb")
@@ -58,21 +57,23 @@ class MemoryMappedGGUF:
             if self._mapping is None:
                 return
             
-            self._refcount -= 1
-            if self._refcount > 0:
-                return
-            
-            if self._mapping:
+            try:
                 self._mapping.close()
-                self._mapping = None
+            except Exception:
+                pass
+            self._mapping = None
             if self._file:
-                self._file.close()
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
                 self._file = None
+            self._refcount = 0
     
     def read(self, offset: int, size: int) -> bytes:
         """Read bytes from memory mapping."""
         if self._mapping is None:
-            raise RuntimeError("MemoryMappedGGUF not open")
+            self.open()
         return self._mapping[offset:offset + size]
     
     def __enter__(self):

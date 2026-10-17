@@ -4,7 +4,7 @@ import time
 
 import numpy as np
 
-from typing import Any
+from typing import Any, Callable
 from pathlib import Path
 
 from .key import ExpertKey
@@ -22,6 +22,7 @@ from .transformer import TransformerBlock
 from .gated_deltanet import GatedDeltaNetLayer, is_recurrent_layer, load_layer_weights
 
 import gguf
+import openvino as ov
 
 
 class Qwen3MoEModel:
@@ -47,7 +48,23 @@ class Qwen3MoEModel:
         ssm_device: str | None = None,
         attention_device: str | None = None,
         weight_cache_capacity: int | None = None,
+        profile_startup: bool = False,
+        startup_progress: Callable[[int, str], None] | None = None,
     ) -> None:
+        startup_phase_started = time.perf_counter()
+
+        def report_progress(percent: int, label: str) -> None:
+            if startup_progress is not None:
+                startup_progress(percent, label)
+
+        def startup_phase(label: str) -> None:
+            nonlocal startup_phase_started
+            if profile_startup:
+                now = time.perf_counter()
+                print(f"[Startup] {label}: "
+                      f"{now - startup_phase_started:.2f} s", flush=True)
+                startup_phase_started = now
+
         self.gguv_path = gguf_path
         self.device = device
         self.max_seq_len = max_seq_len
@@ -59,6 +76,7 @@ class Qwen3MoEModel:
         self._dequant_fn = dequant_fn
         self.ssm_device = ssm_device
         self.attention_device = attention_device
+        self._profile_startup = profile_startup
         self.last_stream_timings: dict[str, int | float] = {
             "prompt_tokens": 0,
             "generated_tokens": 0,
@@ -126,29 +144,55 @@ class Qwen3MoEModel:
                 f"n_v_heads ({self.ssm_n_v}) e head_v_dim ({self.ssm_d_v})")
 
         self.tensor_types = self._build_tensor_types()
+        startup_phase("lettura GGUF e metadati")
+        report_progress(5, "GGUF metadata loaded")
 
         # Build embedding
         embd_t = self.tmap["token_embd.weight"]
-        self.embedding = EmbeddingLookup.from_gguf_tensor(embd_t)
+        embedding_started = time.perf_counter()
+        self.embedding = EmbeddingLookup.from_gguf_tensor(
+            embd_t, dequant_fn=dequant_fn
+        )
+        if profile_startup:
+            print(f"[Startup detail] embedding: "
+                  f"{time.perf_counter() - embedding_started:.2f} s",
+                  flush=True)
 
         # Build LM head
         out_t = self.tmap["output.weight"]
-        self.lm_head = LMHead.from_gguf_tensor(out_t)
+        # Use GPU for LMHead if available (or device specified), which yields ~100x faster logits calculation
+        lm_device = "GPU" if "GPU" in ov.Core().available_devices else self.device
+        lm_startup_timings: dict[str, float] | None = {} if profile_startup else None
+        self.lm_head = LMHead.from_gguf_tensor(
+            out_t, device=lm_device, startup_timings=lm_startup_timings,
+            dequant_fn=dequant_fn,
+        )
+        if lm_startup_timings is not None:
+            print(f"[Startup detail] LM head dequantizzazione: "
+                  f"{lm_startup_timings.get('dequant', 0.0):.2f} s",
+                  flush=True)
+            print(f"[Startup detail] LM head compile OpenVINO: "
+                  f"{lm_startup_timings.get('openvino_compile', 0.0):.2f} s",
+                  flush=True)
 
         # Build output norm
         out_norm_t = self.tmap["output_norm.weight"]
         out_norm_w = np.asarray(out_norm_t.data, dtype=np.float16)
         self.output_norm = RMSNorm(out_norm_w, self.eps)
+        startup_phase("embedding + LM head (dequantizzazione/compile OpenVINO)")
+        report_progress(18, "Embedding and output layer ready")
 
         # Build store + manifest
         from run_q4k_f16_openvino import build_manifest_from_gguf
-        self.manifest = build_manifest_from_gguf(gguf_path)
+        self.manifest = build_manifest_from_gguf(gguf_path, reader=reader)
         
         # Use memory-mapped store for better I/O performance
         StoreClass = MemoryMappedAsyncExpertStore if use_mmap else AsyncExpertStore
         self.store = StoreClass(
             gguf_path.parent, capacity=cache_capacity, manifest=self.manifest
         )
+        startup_phase("manifest GGUF e store")
+        report_progress(24, "Expert index and cache ready")
 
         # Build backend
         self.backend = OpenVINOExpertBackend(
@@ -159,6 +203,8 @@ class Qwen3MoEModel:
             tensor_types=self.tensor_types,
             dequant_fn=dequant_fn,
         )
+        startup_phase("backend OpenVINO expert")
+        report_progress(29, "OpenVINO expert backend ready")
 
         # Un router per layer: ffn_gate_inp.weight e' (2048, 256) e cambia
         # in ogni strato. Un router unico condiviso farebbe selezionare lo
@@ -171,6 +217,8 @@ class Qwen3MoEModel:
         # Compatibilita': i call site che leggono model.router continuano a
         # funzionare e ottengono il router del layer 0.
         self.router = self.routers[0]
+        startup_phase("router per layer")
+        report_progress(32, "Routing tables ready")
 
         # Shared expert: MLP denso che OGNI token attraversa, oltre ai top-k
         # selezionati dal router. Senza, l'output di ogni layer e' sbagliato.
@@ -181,7 +229,10 @@ class Qwen3MoEModel:
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
                 dequant_fn=dequant_fn,
+                reader=reader,
             )
+        startup_phase("shared expert (lettura e conversione pesi)")
+        report_progress(35, "Shared expert ready")
 
         # Build transformer blocks
         self.blocks: list[TransformerBlock] = []
@@ -191,10 +242,38 @@ class Qwen3MoEModel:
         # proiezioni del delta net, quindi non vanno tenuti anche nel blocco:
         # tenere entrambe le copie costava 1,4 GiB.
         self.ssm: dict[int, GatedDeltaNetLayer] = {}
+        self._startup_ssm_weights_seconds = 0.0
+        self._startup_ssm_construct_seconds = 0.0
+        ssm_build_started = time.perf_counter()
+        ssm_layers = [
+            layer for layer in range(self.block_count)
+            if is_recurrent_layer(self.tmap, layer)
+        ]
+        for ssm_index, layer in enumerate(ssm_layers, start=1):
+            self.ssm[layer] = self._build_ssm(layer)
+            if ssm_index == len(ssm_layers) or ssm_index % 10 == 0:
+                pct = 35 + round(30 * ssm_index / max(1, len(ssm_layers)))
+                report_progress(pct, f"Building recurrent layers ({ssm_index}/{len(ssm_layers)})")
+        ssm_build_seconds = time.perf_counter() - ssm_build_started
+
+        block_build_started = time.perf_counter()
         for layer in range(self.block_count):
-            if is_recurrent_layer(self.tmap, layer):
-                self.ssm[layer] = self._build_ssm(layer)
             self.blocks.append(self._build_block(layer))
+            if (layer + 1) % 10 == 0 or layer + 1 == self.block_count:
+                pct = 65 + round(30 * (layer + 1) / self.block_count)
+                report_progress(pct, f"Building transformer layers ({layer + 1}/{self.block_count})")
+        block_build_seconds = time.perf_counter() - block_build_started
+        if profile_startup:
+            print(f"[Startup detail] pesi SSM: "
+                  f"{self._startup_ssm_weights_seconds:.2f} s", flush=True)
+            print(f"[Startup detail] costruzione/compile OpenVINO SSM "
+                  f"({len(self.ssm)} layer): "
+                  f"{self._startup_ssm_construct_seconds:.2f} s", flush=True)
+            print(f"[Startup] costruzione SSM ({len(self.ssm)} layer): "
+                  f"{ssm_build_seconds:.2f} s", flush=True)
+            print(f"[Startup] blocchi attenzione/norme "
+                  f"({self.block_count} layer): {block_build_seconds:.2f} s",
+                  flush=True)
         # Il blocco di un layer ricorrente riceve il richiamo al delta net:
         # e' l'unico modo che ha il blocco di sapere cosa mettere al posto
         # dell'attenzione, senza duplicare la ricorrenza.
@@ -208,6 +287,8 @@ class Qwen3MoEModel:
         if keep_ssm_f32:
             for lyr in self.ssm.values():
                 lyr.promote_to_f32()
+        startup_phase("costruzione layer, pesi SSM e compile OpenVINO")
+        report_progress(97, "Finalizing model")
 
     def _build_ssm(self, layer: int) -> GatedDeltaNetLayer:
         """Costruisce il Gated DeltaNet di un layer ricorrente.
@@ -255,8 +336,11 @@ class Qwen3MoEModel:
                 f"{head_k_dim} fa {key_dim // self.ssm_n_k}, non {head_k_dim}: "
                 "head_k_dim non combacia")
 
+        weights_started = time.perf_counter()
         weights = load_layer_weights(self.tmap, layer, self._dequant_fn)
-        return GatedDeltaNetLayer(
+        weights_elapsed = time.perf_counter() - weights_started
+        construct_started = time.perf_counter()
+        result = GatedDeltaNetLayer(
             layer_idx=layer,
             hidden_size=self.hidden_size,
             n_v_heads=self.ssm_n_v,
@@ -268,6 +352,16 @@ class Qwen3MoEModel:
             eps=self.eps,
             projection_device=self.ssm_device,
         )
+        if getattr(self, "_profile_startup", False):
+            self._startup_ssm_weights_seconds = (
+                getattr(self, "_startup_ssm_weights_seconds", 0.0)
+                + weights_elapsed
+            )
+            self._startup_ssm_construct_seconds = (
+                getattr(self, "_startup_ssm_construct_seconds", 0.0)
+                + time.perf_counter() - construct_started
+            )
+        return result
 
     def _build_tensor_types(self) -> dict[int, dict[str, int]]:
         """Reads ggml types per-layer for expert tensors (gate/up/down)."""
@@ -300,6 +394,9 @@ class Qwen3MoEModel:
             return np.asarray(t.data, dtype=np.float16).reshape(shape)
         else:
             raw = t.data.tobytes() if hasattr(t.data, "tobytes") else t.data
+            n_elements = int(np.prod(shape))
+            if self._dequant_fn is not None:
+                return self._dequant_fn(raw, ttype, n_elements).reshape(shape)
             return dequantize_to(
                 np.frombuffer(raw, dtype=np.uint8), ttype, "f16"
             ).reshape(shape)
@@ -510,10 +607,13 @@ class Qwen3MoEModel:
 
         for produced in range(1, max_new_tokens + 1):
             step_started = time.perf_counter()
-            logits = self.output_norm.forward(x)
+            # Per scegliere il prossimo token servono solo i logits dell'ultima
+            # posizione. Proiettare l'intero prompt sulla vocab size spreca
+            # lavoro O(seq * vocab) e impedisce alla LM head di usare il suo
+            # percorso OpenVINO a singolo token.
+            last_hidden = x[:, -1:, :]
+            logits = self.output_norm.forward(last_hidden)
             logits = self.lm_head.forward(logits)
-            # (1, seq, vocab) -> solo l'ultima posizione: e' li' che si
-            # campiona. logit[-1] avrebbe restituito tutta la sequenza.
             last_logits = np.asarray(logits[0, -1], dtype=np.float32).reshape(-1)
 
             next_token = sample(

@@ -107,7 +107,7 @@ def main() -> int:
     diff = np.abs(lm_head.weight - ref_out_weight.astype(np.float16)).max()
     print(f"  Max diff vs reference (f16 rounding): {diff:.3e}")
     check("LM head weights bit-exact vs reference", diff == 0.0, f"diff={diff:.3e}")
-    check("LM head weights tenuti in f32", lm_head.weight.dtype == np.float32,
+    check("LM head weights tenuti in f16", lm_head.weight.dtype == np.float16,
           f"{lm_head.weight.dtype}")
 
     # Test forward: hidden -> logits

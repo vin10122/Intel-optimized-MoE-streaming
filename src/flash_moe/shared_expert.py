@@ -120,13 +120,14 @@ class SharedExpert:
 
     def __init__(self, gguf_path: str | Path, num_layers: int,
                  hidden_size: int, intermediate_size: int,
-                 dequant_fn: Any = None) -> None:
+                 dequant_fn: Any = None, reader: Any = None) -> None:
         import gguf
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self._dequant_fn = dequant_fn
-        reader = gguf.GGUFReader(gguf_path)
+        if reader is None:
+            reader = gguf.GGUFReader(gguf_path)
         tensor_map = {t.name: t for t in reader.tensors}
 
         self.layers: dict[int, dict] = {}

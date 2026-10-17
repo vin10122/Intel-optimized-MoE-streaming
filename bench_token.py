@@ -76,9 +76,18 @@ def main():
 
     print(f"modello: {path.name}")
     t0 = time.perf_counter()
-    model = Qwen3MoEModel(path, device=(sys.argv[1] if len(sys.argv) > 1 else "CPU"),
-                      max_seq_len=256, cache_capacity=64,
-                         dequant_fn=dequant_to_f16)
+    # Dispositivo per esperti: CPU per minima latenza dispatch
+    # Dispositivo per proiezioni fisse: GPU Arc (con accelerazione XMX)
+    model = Qwen3MoEModel(
+        path,
+        device=(sys.argv[1] if len(sys.argv) > 1 else "CPU"),
+        max_seq_len=256,
+        cache_capacity=64,
+        dequant_fn=dequant_to_f16,
+        use_mmap=True,
+        ssm_device="GPU",
+        attention_device="GPU",
+    )
     load_s = time.perf_counter() - t0
     print(f"caricamento: {load_s:.1f} s, RSS {rss_mib():.0f} MiB")
     print(f"{model.block_count} layer, {model.num_experts} expert, top-{model.top_k}")
