@@ -5,8 +5,9 @@ Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precision
 * **f16, non bf16.** I pesi bf16 passati come ``numpy`` ``uint16`` a una porta
   ``ov.Type.bf16`` vengono reinterpretati come interi: 2048 NaN su GPU, errore
   6e+19 su CPU. Con ``numpy`` ``float16`` nativo l'errore relativo e' 3,8e-04.
-* **Un solo request riutilizzato** per shape: crearlo costa 0,018 ms, quindi
-  era irrilevante, ma non costa nulla riutilizzarlo.
+* **Un request per thread e shape**: i worker riusano request indipendenti.
+  Il prefill usa un grafo con numero di token dinamico e quattro thread CPU;
+  il decode OpenVINO usa un thread per expert e due worker di default.
 * **Device di default = CPU.** Con i pesi passati a ogni chiamata il plugin GPU
   gira a 1,05 GB/s contro i 5,25 GB/s del plugin CPU, e finisce 5x piu' lento.
   Su 320 GEMM da 4 MFLOP il trasferimento dei pesi domina il compute, e
@@ -34,7 +35,10 @@ Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precision
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+import threading
+from functools import wraps
 
 import numpy as np
 import openvino as ov
@@ -67,13 +71,41 @@ def pick_device(core: ov.Core, requested: str = "AUTO") -> str:
     return available[0] if available else "CPU"
 
 
+def _own_weights(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._memory_lock:
+            self._active += 1
+        try:
+            return method(self, *args, **kwargs).copy()
+        finally:
+            with self._memory_lock:
+                self._active -= 1
+                if not self._active:
+                    retired, self._retired = self._retired, []
+                    for weights in retired:
+                        self._recycle(weights)
+    return call
+
+
+def _compile_serially(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._compile_lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class OpenVINOExpertBackend:
     """OpenVINO-accelerated SwiGLU expert execution backend."""
 
     def __init__(self, store: ExpertStore, device: str = "AUTO",
                  weight_dtype: str = "f16", cache_capacity: int = 0,
                  tensor_types: dict[int, dict[str, int]] | None = None,
-                 dequant_fn: Any = None) -> None:
+                 dequant_fn: Any = None,
+                 inference_threads: int = 1, prefill_threads: int = 4,
+                 expert_workers: int = 2, native_decode: str = "auto",
+                 native_library=None) -> None:
         self.store = store
         self.core = ov.Core()
         self.target_device = pick_device(self.core, device)
@@ -93,8 +125,24 @@ class OpenVINOExpertBackend:
                 f"cache_capacity must be >= 0, got {self.cache_capacity}"
             )
 
+        if min(inference_threads, prefill_threads, expert_workers) < 1:
+            raise ValueError("thread and worker counts must be positive")
+        self.inference_threads = inference_threads
+        self.prefill_threads = prefill_threads
+        self._ov_properties = {"INFERENCE_NUM_THREADS": str(inference_threads)}
+        self._memory_lock = threading.RLock()
+        self._compile_lock = threading.Lock()
+        self._active = 0
+        self._retired = []
+        from .native_expert import load_native_expert
+        self.native_expert = load_native_expert(
+            native_decode, native_library, self.target_device, self.tensor_types
+        )
+        self._native_enabled = False
+
         self._compiled_models: dict[tuple[int, int], Any] = {}
-        self._requests: dict[tuple[int, int], Any] = {}
+        self._batch_compiled_models: dict[tuple[int, int], Any] = {}
+        self._thread_local = threading.local()
         self._weight_cache: OrderedDict[
             ExpertKey, tuple[np.ndarray, np.ndarray, np.ndarray]
         ] = OrderedDict()
@@ -107,20 +155,61 @@ class OpenVINOExpertBackend:
         # OpenVINO >= 2022.3 accetta share_inputs. Se il parametro non esiste
         # il fallback sopra lo spegne da solo e il backend continua a funzionare.
         self._share_inputs = True
+        self._lock = threading.Lock()
+        # Reuse a bounded worker pool across all layers and decode steps.
+        self._moe_executor = ThreadPoolExecutor(max_workers=expert_workers)
 
         print(f"[OpenVINOBackend] device={self.target_device} "
-              f"weights={weight_dtype} available={self.core.available_devices}")
+              f"weights={weight_dtype} inference_threads={self.inference_threads} "
+              f"available={self.core.available_devices}")
 
     # ------------------------------------------------------------------ graph
 
+    @_compile_serially
     def _get_request(self, hidden_size: int, intermediate_size: int):
         key = (hidden_size, intermediate_size)
-        request = self._requests.get(key)
-        if request is not None:
-            return request
+        compiled = self._compiled_models.get(key)
+        if compiled is None:
+            x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
+            model = self._build_expert_graph(x, hidden_size, intermediate_size)
+            compiled = self.core.compile_model(
+                model, self.target_device, self._ov_properties
+            )
+            self._compiled_models[key] = compiled
+        tl = getattr(self._thread_local, "requests", None)
+        if tl is None:
+            tl = {}
+            self._thread_local.requests = tl
+        request = tl.get(key)
+        if request is None:
+            request = compiled.create_infer_request()
+            tl[key] = request
+        return request
 
+    @_compile_serially
+    def _get_batch_request(self, hidden_size: int, intermediate_size: int):
+        key = (hidden_size, intermediate_size)
+        compiled = self._batch_compiled_models.get(key)
+        if compiled is None:
+            x = ops.parameter([-1, hidden_size], ov.Type.f32, name="activation")
+            model = self._build_expert_graph(x, hidden_size, intermediate_size)
+            compiled = self.core.compile_model(
+                model, self.target_device, dict(self._ov_properties, INFERENCE_NUM_THREADS=str(self.prefill_threads))
+            )
+            self._batch_compiled_models[key] = compiled
+        tl = getattr(self._thread_local, "batch_requests", None)
+        if tl is None:
+            tl = {}
+            self._thread_local.batch_requests = tl
+        request = tl.get(key)
+        if request is None:
+            request = compiled.create_infer_request()
+            tl[key] = request
+        return request
+
+    @staticmethod
+    def _build_expert_graph(x, hidden_size: int, intermediate_size: int):
         wtype = ov.Type.f16
-        x = ops.parameter([1, hidden_size], ov.Type.f32, name="activation")
         # I pesi sono gia' nella disposizione in cui stanno nel GGUF: gate e up
         # sono (n_ff, n_embd), down e' (n_embd, n_ff). Il GGUF li descrive come
         # {n_embd, n_ff, n_expert}, cioe' con l'hidden sull'asse veloce, quindi
@@ -145,25 +234,20 @@ class OpenVINOExpertBackend:
 
         model = ov.Model([ops.convert(out, ov.Type.f32)], [x, gate, up, down],
                          name="SwiGLU_Expert")
-        compiled = self.core.compile_model(model, self.target_device)
-        self._compiled_models[key] = compiled
-        request = compiled.create_infer_request()
-        self._requests[key] = request
-        return request
+        return model
 
     # ------------------------------------------------------------------ weights
 
     def _weights(self, key: ExpertKey, hidden_size: int,
                  intermediate_size: int):
-        cached = self._weight_cache.get(key)
-        if cached is not None:
-            self._weight_cache.move_to_end(key)
-            return cached
+        with self._lock:
+            cached = self._weight_cache.get(key)
+            if cached is not None:
+                self._weight_cache.move_to_end(key)
+                return cached
 
-        # gate/up stanno in memoria come (n_ff, n_hidden) e down come
-        # (n_hidden, n_ff): sono le forme che il grafo si aspetta, vedi
-        # ``_get_request``. Il reshape e' su quello che c'e' nel file, senza
-        # trasporre: cosi' il dequant scrive gia' nella disposizione giusta.
+        # Dequantizzazione fuori lock: gli expert diversi possono dequantizzare
+        # in parallelo senza serializzarsi. Il peso gia' in cache vince al rientro.
         layer_types = self.tensor_types.get(key.layer, {})
         gate = self._decode(self.store.read_tensor(key, "gate"),
                             layer_types.get("gate"),
@@ -176,19 +260,30 @@ class OpenVINOExpertBackend:
                             (hidden_size, intermediate_size))
 
         weights = (gate, up, down)
-        self._weight_cache[key] = weights
-        if self.cache_capacity and len(self._weight_cache) > self.cache_capacity:
-            _, oldest_weights = self._weight_cache.popitem(last=False)
-            self._release(oldest_weights)
-        return weights
+        with self._lock:
+            existing = self._weight_cache.get(key)
+            if existing is not None:
+                self._weight_cache.move_to_end(key)
+                self._release(weights)
+                return existing
+            self._weight_cache[key] = weights
+            if self.cache_capacity and len(self._weight_cache) > self.cache_capacity:
+                _, oldest_weights = self._weight_cache.popitem(last=False)
+                self._release(oldest_weights)
+            return weights
 
     def _release(self, weights) -> None:
+        with self._memory_lock:
+            if self._active:
+                self._retired.append(weights)
+            else:
+                self._recycle(weights)
+
+    def _recycle(self, weights) -> None:
         """Ricicla i buffer di un expert evictato.
 
-        Il backend non espone i propri array: ``_weights`` e' privato e
-        ``forward`` consuma i pesi in ``infer`` prima di restituire, quindi
-        un buffer evictato non e' piu' letto da nessuno. Tenerlo in una lista
-        di riuso evita che il prossimo expert debba faultare pagine nuove.
+        Chiamata solo quando nessun forward puo' leggere i buffer ritirati.
+        ``_own_weights`` ne rinvia il riciclo fino all'ultimo worker attivo.
 
         I pool sono limitati a pochi buffer per classe: servono a
         evitare i page fault delle allocazioni nuove, non a trattenere
@@ -202,6 +297,8 @@ class OpenVINOExpertBackend:
         if weights is None:
             return
         for array in weights:
+            if not array.flags.writeable:
+                continue
             n = array.size
             slot = self._pool.get(n)
             if slot is None:
@@ -210,9 +307,10 @@ class OpenVINOExpertBackend:
                 slot.append(array)
 
     def _acquire(self, n_elements: int) -> np.ndarray:
-        slot = self._pool.get(n_elements)
-        if slot:
-            return slot.pop()
+        with self._memory_lock:
+            slot = self._pool.get(n_elements)
+            if slot:
+                return slot.pop()
         return np.empty(n_elements, dtype=self.weight_dtype)
 
     def pool_size(self) -> int:
@@ -245,17 +343,50 @@ class OpenVINOExpertBackend:
         self._weights(key, hidden_size, intermediate_size)
 
     def cache_size(self) -> int:
-        return len(self._weight_cache)
+        with self._lock:
+            return len(self._weight_cache)
 
     def clear_cache(self) -> None:
-        self._weight_cache.clear()
-        for slot in self._pool.values():
-            slot.clear()
+        with self._lock, self._memory_lock:
+            if self._active:
+                raise RuntimeError("cannot clear weights during inference")
+            self._weight_cache.clear()
+            self._pool.clear()
+            self._retired.clear()
+
+    def prefetch_weights(self, keys):
+        with self._lock:
+            needed = [key for key in keys if key not in self._weight_cache]
+        discard = getattr(self.store, "discard_prefetch_except", None)
+        if discard is not None:
+            discard(needed)
+        return self.store.prefetch_many(needed)
+
+    def begin_decode(self):
+        if self.native_expert is not None:
+            self.clear_cache()
+            self._native_enabled = True
+
+    def begin_prefill(self):
+        self._native_enabled = False
+
+    def _native_forward(self, key, activation, hidden_size, intermediate_size):
+        return self.native_expert.forward(
+            self.store.read_all(key), self.tensor_types[key.layer],
+            activation, hidden_size, intermediate_size,
+        )
+
+    def close(self):
+        self._moe_executor.shutdown(wait=True)
+        self.clear_cache()
 
     # ------------------------------------------------------------------ forward
 
+    @_own_weights
     def forward(self, key: ExpertKey, activation: list[float] | np.ndarray,
                 hidden_size: int, intermediate_size: int) -> np.ndarray:
+        if self._native_enabled:
+            return self._native_forward(key, activation, hidden_size, intermediate_size)
         gate, up, down = self._weights(key, hidden_size, intermediate_size)
         request = self._get_request(hidden_size, intermediate_size)
 
@@ -272,6 +403,32 @@ class OpenVINOExpertBackend:
         }
         result = self._infer(request, feed)
         return np.asarray(list(result.values())[0], dtype=np.float32).reshape(hidden_size)
+
+    @_own_weights
+    def forward_batch(self, key: ExpertKey, activations: np.ndarray,
+                      hidden_size: int, intermediate_size: int) -> np.ndarray:
+        """Run one expert for multiple prompt tokens with a shared weight load."""
+        x = np.ascontiguousarray(activations, dtype=np.float32)
+        if x.ndim != 2 or x.shape[1] != hidden_size:
+            raise ValueError(
+                f"expert activations must have shape (tokens, {hidden_size}), "
+                f"got {x.shape}"
+            )
+        if x.shape[0] == 0:
+            return np.empty((0, hidden_size), dtype=np.float32)
+
+        gate, up, down = self._weights(key, hidden_size, intermediate_size)
+        request = self._get_batch_request(hidden_size, intermediate_size)
+        feed = {
+            "activation": x,
+            "gate": gate,
+            "up": up,
+            "down": down,
+        }
+        result = self._infer(request, feed)
+        return np.asarray(
+            list(result.values())[0], dtype=np.float32
+        ).reshape(x.shape[0], hidden_size)
 
     def _infer(self, request, feed: dict):
         """Inferenza senza copia degli input.

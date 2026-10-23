@@ -52,7 +52,7 @@ check("l2_norm su zero non divide per zero",
 print("\n2. ricorrenza contro reference matriciale indipendente")
 # un layer con pesi fittizi: conta solo la ricorrenza
 H = 16
-# qkv e' (H, key_dim*2 + value_dim): la stessa formula di llama.cpp
+# Pesi normalizzati in memoria come (out, in), come load_layer_weights.
 _key_dim = DK * NV
 _value_dim = DV * NV
 _qkv_dim = _key_dim * 2 + _value_dim
@@ -60,15 +60,15 @@ layer = GatedDeltaNetLayer(
     layer_idx=0, hidden_size=H, n_v_heads=NV, n_k_heads=NV,
     head_k_dim=DK, head_v_dim=DV, conv_kernel=4,
     weights={
-        "qkv": rng.standard_normal((H, _qkv_dim)).astype(np.float16),
-        "gate": rng.standard_normal((H, _value_dim)).astype(np.float16),
-        "beta": rng.standard_normal((H, NV)).astype(np.float16),
-        "alpha": rng.standard_normal((H, NV)).astype(np.float16),
-        "conv1d": rng.standard_normal((4, _qkv_dim)).astype(np.float16),
+        "qkv": rng.standard_normal((_qkv_dim, H)).astype(np.float16),
+        "gate": rng.standard_normal((_value_dim, H)).astype(np.float16),
+        "beta": rng.standard_normal((NV, H)).astype(np.float16),
+        "alpha": rng.standard_normal((NV, H)).astype(np.float16),
+        "conv1d": rng.standard_normal((_qkv_dim, 4)).astype(np.float16),
         "dt_bias": rng.standard_normal(NV).astype(np.float16),
         "a": (-np.exp(rng.standard_normal(NV))).astype(np.float16),
         "norm": rng.standard_normal(DV).astype(np.float16),
-        "out": rng.standard_normal((_value_dim, H)).astype(np.float16),
+        "out": rng.standard_normal((H, _value_dim)).astype(np.float16),
     },
 )
 
@@ -79,15 +79,15 @@ ref_conv = np.zeros((layer.conv_dim, 3), dtype=np.float64)
 def ref_step(x):
     """Ricorrenza in forma matriciale, senza cicli su S."""
     w32 = {k: v.astype(np.float64) for k, v in layer.w.items()}
-    qkv = x @ w32["qkv"]
-    beta = _sigmoid(x @ w32["beta"])
-    alpha = x @ w32["alpha"]
+    qkv = x @ w32["qkv"].T
+    beta = _sigmoid(x @ w32["beta"].T)
+    alpha = x @ w32["alpha"].T
     gate = _softplus(alpha + w32["dt_bias"]) * w32["a"]
 
-    # conv: finestra [coda; token], kernel trasposta su (conv_dim, conv_kernel)
+    # conv: finestra [coda; token], kernel (conv_dim, conv_kernel)
     seq = np.concatenate([ref_conv, qkv.reshape(layer.conv_dim, 1)], axis=1)
     ref_conv[:] = seq[:, 1:]
-    conv = _silu(np.einsum("ck,ck->c", seq, w32["conv1d"].T))
+    conv = _silu(np.einsum("ck,ck->c", seq, w32["conv1d"]))
     key_dim = DK * NV
     q = conv[:key_dim].reshape(NV, DK)
     k = conv[key_dim:2 * key_dim].reshape(NV, DK)
@@ -108,10 +108,10 @@ def ref_step(x):
         outs.append(ref_state[h] @ q[h])
     head_out = np.array(outs)
 
-    zr = (x @ w32["gate"]).reshape(NV, DV)
+    zr = (x @ w32["gate"].T).reshape(NV, DV)
     rms = head_out / np.sqrt(np.mean(head_out ** 2, axis=-1, keepdims=True) + 1e-6)
     gated = rms * w32["norm"] * _silu(zr)
-    return gated.reshape(-1) @ w32["out"], ref_state
+    return gated.reshape(-1) @ w32["out"].T, ref_state
 
 # La reference gira in f64 e il layer in f32 (i pesi sono f16 e gli
 # accumulatori per-token f32, per vincolo), quindi l'uguaglianza e' fino

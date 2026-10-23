@@ -50,6 +50,10 @@ class Qwen3MoEModel:
         weight_cache_capacity: int | None = None,
         profile_startup: bool = False,
         startup_progress: Callable[[int, str], None] | None = None,
+        native_decode: str = "auto",
+        native_library: Path | None = None,
+        expert_workers: int = 2,
+        prefill_threads: int = 4,
     ) -> None:
         startup_phase_started = time.perf_counter()
 
@@ -202,6 +206,8 @@ class Qwen3MoEModel:
             cache_capacity=self.weight_cache_capacity,
             tensor_types=self.tensor_types,
             dequant_fn=dequant_fn,
+            native_decode=native_decode, native_library=native_library,
+            expert_workers=expert_workers, prefill_threads=prefill_threads,
         )
         startup_phase("backend OpenVINO expert")
         report_progress(29, "OpenVINO expert backend ready")
@@ -534,12 +540,11 @@ class Qwen3MoEModel:
             raise ValueError(
                 f"il delta net ha stato singolo: batch {b} non supportato, "
                 "perche' le due sequenze condividerebbero lo stesso stato")
-        out = np.empty((b, s, h), dtype=np.float32)
-        for si in range(s):
-            out[0, si, :] = layer.forward(x[0, si, :])
-        return out
+        return layer.forward_sequence(x[0]).reshape(b, s, h)
 
     def init_caches(self) -> None:
+        self.backend.begin_prefill()
+        self._prefill_pending = True
         for block in self.blocks:
             if not block.is_ssm:
                 block.init_kv_cache(self.max_seq_len)
@@ -681,7 +686,11 @@ class Qwen3MoEModel:
         """Attraversa tutti i 40 layer nell'ordine, ricorrenti e attenzione."""
         for layer in range(self.block_count):
             x = self.blocks[layer].forward(x)
+        if getattr(self, "_prefill_pending", False):
+            self.backend.begin_decode()
+            self._prefill_pending = False
         return x
 
     def close(self) -> None:
+        self.backend.close()
         self.store.close()

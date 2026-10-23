@@ -11,7 +11,7 @@ from .rope import RoPE, DEFAULT_ROPE_DIM, DEFAULT_FREQ_BASE
 from .attention import AttentionLayer, KVCache, scaled_dot_product_attention, softmax
 from .backend_ov import OpenVINOExpertBackend
 from .router import ExpertRouter
-from .moe_layer import run_moe_layer
+from .moe_layer import run_moe_layer, run_moe_sequence
 
 
 class TransformerBlock:
@@ -178,6 +178,17 @@ class TransformerBlock:
             return x  # identity if no MoE
 
         b, s, h = x.shape
+        if b == 1 and s > 1:
+            return run_moe_sequence(
+                layer=self.layer_idx,
+                activations=x[0],
+                router=self.router,
+                backend=self.backend,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                shared_expert=self.shared_expert,
+            ).reshape(1, s, h)
+
         result = np.zeros_like(x)
         for si in range(s):
             activation = x[0, si, :]
@@ -229,8 +240,8 @@ class TransformerBlock:
         # 2. MoE feed-forward
         normed2 = self.post_attn_norm.forward(h)
 
-        # _moe_forward itera gia' su tutte le posizioni della sequenza, quindi
-        # prefill e decode passano dallo stesso ramo.
+        # _moe_forward raggruppa i token per expert durante il prefill;
+        # nel decode di un singolo token resta sul percorso singolo.
         moe_out = self._moe_forward(normed2)
 
         return h + moe_out

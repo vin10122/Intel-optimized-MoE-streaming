@@ -1,3 +1,4 @@
+import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -134,130 +135,105 @@ class RAMBoundedExpertStore(ExpertStore):
         super().__init__(root=root, capacity=capacity, manifest=manifest)
 
 
-class AsyncExpertStore(RAMBoundedExpertStore):
-    """Store con prefetch asincrono e letture in parallelo.
+class AsyncPrefetchMixin:
+    """Bounded prefetch with cache metadata protected across expert workers.
 
-    A prefetch submits only the expert's own tensor ranges to the executor.
-    The future holds the loaded tensors; the cache is mutated exclusively by
-    the calling thread when it consumes the future, so no lock is needed and
-    a prefetched-but-unused expert never pollutes the LRU.
-
-    Sul numero di worker. ``max_workers=1`` serializzava le 8 letture di un
-    layer: misurate a cache svuotata su questo disco, 8 regioni sparse nel
-    file da 17 GiB costano 19,2 ms in sequenza e 5,7 ms con 4 thread, cioe'
-    3,4x. Oltre i 4 non si guadagna piu' (6,2 ms con 8, 5,4 ms con 16):
-    la coda del dispositivo e' satura e altri thread aggiungono solo
-    contesa. Il default 4 viene da quella misura, non da un numero scelto.
-
-    Sul prefetch che non nasconde la latenza. Su un singolo token la catena
-    e' strettamente sequenziale: gli expert del layer L+1 si conoscono solo
-    dopo che l'output del layer L e' stato calcolato, e a quel punto sono
-    gia' stati letti quelli del layer L. Non c'e' lavoro da sovrapporre.
-    Quello che il batch porta e' il parallelismo fra gli 8 expert dello
-    stesso layer. Per nascondere davvero l'I/O servirebbero almeno due
-    token in volo, cioe' un pipeline: e' un cambiamento architetturale
-    diverso, non un parametro.
+    Future waits and file I/O stay outside the lock. Failed reads propagate;
+    a prefetched result enters the LRU only when inference consumes it.
     """
+
+    def _init_async(self, workers):
+        if workers is not None and workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = self.DEFAULT_WORKERS if workers is None else workers
+        self.executor = ThreadPoolExecutor(max_workers=self.workers)
+        self.pending_loads = {}
+        self.pending_limit = 8
+        self._cache_lock = threading.RLock()
+
+    def prefetch(self, key):
+        return self.prefetch_many([key])
+
+    def get(self, key):
+        return b"".join(self.read_all(key).values())
+
+    def discard_prefetch_except(self, keys):
+        needed = set(keys)
+        with self._cache_lock:
+            for key, future in list(self.pending_loads.items()):
+                if key not in needed and (future.done() or future.cancel()):
+                    self.pending_loads.pop(key, None)
+
+    def resident_keys(self):
+        with self._cache_lock:
+            return tuple(self._cache)
+
+    def clear(self):
+        with self._cache_lock:
+            for future in self.pending_loads.values():
+                future.cancel()
+            self.pending_loads.clear()
+            self._cache.clear()
+
+    def prefetch_many(self, keys):
+        queued = 0
+        with self._cache_lock:
+            for key in keys:
+                if key in self._cache or key in self.pending_loads:
+                    continue
+                if len(self.pending_loads) >= self.pending_limit:
+                    break
+                if self.manifest is None and not self._path_for(key).exists():
+                    continue
+                self.pending_loads[key] = self.executor.submit(self._read_expert, key)
+                queued += 1
+        return queued
+
+    def read_all(self, key):
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                self.stats.hits += 1
+                return cached
+            future = self.pending_loads.get(key)
+        if future is None:
+            tensors = self._read_expert(key)
+        else:
+            # Preserve read errors; silently retrying hides real failures.
+            tensors = future.result()
+        with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                self.stats.hits += 1
+                return cached
+            if future is not None and self.pending_loads.get(key) is future:
+                self.pending_loads.pop(key)
+                self.stats.prefetch_hits += 1
+            else:
+                self.stats.misses += 1
+            self.stats.bytes_read += sum(map(len, tensors.values()))
+            return self._admit(key, tensors)
+
+    def read_tensor(self, key, name):
+        if self.manifest is None:
+            raise ValueError('read_tensor requires a manifest')
+        tensors = self.read_all(key)
+        with self._cache_lock:
+            self.stats.tensor_reads += 1
+        return tensors[name]
+
+
+class AsyncExpertStore(AsyncPrefetchMixin, RAMBoundedExpertStore):
+    """Asynchronous range reads; four I/O workers and eight pending experts."""
 
     DEFAULT_WORKERS = 4
 
-    def __init__(self, root: str | Path, capacity: int = 2, manifest: Any = None,
-                 workers: int | None = None):
+    def __init__(self, root, capacity=2, manifest=None, workers=None):
         super().__init__(root, capacity, manifest)
-        if workers is not None and workers < 1:
-            raise ValueError(f"workers must be at least 1, got {workers}")
-        self.workers = self.DEFAULT_WORKERS if workers is None else workers
-        self.executor = ThreadPoolExecutor(max_workers=self.workers)
-        self.pending_loads: dict[ExpertKey, Future] = {}
+        self._init_async(workers)
 
-    def prefetch(self, key: ExpertKey) -> None:
-        if key in self._cache or key in self.pending_loads:
-            return
-        if self.manifest is None and not self._path_for(key).exists():
-            return
-        self.pending_loads[key] = self.executor.submit(self._read_expert, key)
-
-    def prefetch_many(self, keys: Iterable[ExpertKey]) -> int:
-        """Accoda in un colpo tutti gli expert di una decisione di routing.
-
-        E' questo il punto in cui il routing guidato serve: gli indici non
-        sono un'anticipazione inventata ma l'output reale di
-        ``ExpertRouter.route``, quindi gli expert da leggere sono noti prima
-        di iniziare a leggerli. Restituisce quanti sono stati accodati
-        davvero, esclusi quelli gia' in cache o gia' in coda.
-        """
-        queued = 0
-        for key in keys:
-            if key in self._cache or key in self.pending_loads:
-                continue
-            if self.manifest is None and not self._path_for(key).exists():
-                continue
-            self.pending_loads[key] = self.executor.submit(self._read_expert, key)
-            queued += 1
-        return queued
-
-    def _consume(self, key: ExpertKey) -> dict[str, bytes] | None:
-        future = self.pending_loads.pop(key, None)
-        if future is None:
-            return None
-        try:
-            tensors = future.result()
-        except Exception:
-            return None
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)
-
-    def read_all(self, key: ExpertKey) -> dict[str, bytes]:
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            return cached
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            return prefetched
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)
-
-    def read_tensor(self, key: ExpertKey, name: str) -> bytes:
-        if self.manifest is None:
-            raise ValueError("read_tensor requires a manifest with tensor slices")
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            self.stats.tensor_reads += 1
-            return cached[name]
-
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            self.stats.tensor_reads += 1
-            return prefetched[name]
-
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.tensor_reads += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)[name]
-
-    def get(self, key: ExpertKey) -> bytes:
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            return b"".join(cached.values())
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            return b"".join(prefetched.values())
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return b"".join(self._admit(key, tensors).values())
-
-    def close(self) -> None:
+    def close(self):
         self.executor.shutdown(wait=True)
+        self.clear()

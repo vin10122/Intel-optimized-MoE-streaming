@@ -31,7 +31,7 @@ class OpenVINODeltaNetProjections:
         self.device = device
         core = _get_core(device)
 
-        x = ops.parameter([1, int(weights["qkv"].shape[1])],
+        x = ops.parameter([-1, int(weights["qkv"].shape[1])],
                           ov.Type.f32, name="hidden")
         x16 = ops.convert(x, ov.Type.f16)
         qkv_w = ops.constant(
@@ -52,7 +52,7 @@ class OpenVINODeltaNetProjections:
         self.input_model = core.compile_model(input_model, device)
         self.input_request = self.input_model.create_infer_request()
 
-        out_x = ops.parameter([1, int(weights["out"].shape[1])],
+        out_x = ops.parameter([-1, int(weights["out"].shape[1])],
                               ov.Type.f32, name="gated")
         out_w = ops.constant(
             np.ascontiguousarray(weights["out"], dtype=np.float16),
@@ -87,3 +87,14 @@ class OpenVINODeltaNetProjections:
         return np.asarray(
             results[self.output_model.output(0)], dtype=np.float32
         ).reshape(-1)
+
+    def inputs_many(self, values):
+        values = np.ascontiguousarray(values, dtype=np.float32)
+        result = self.input_request.infer({self.input_model.input(0): values})
+        return tuple(np.asarray(result[self.input_model.output(i)],
+                                dtype=np.float32).copy() for i in (0, 1))
+
+    def output_many(self, values):
+        values = np.ascontiguousarray(values, dtype=np.float32)
+        result = self.output_request.infer({self.output_model.input(0): values})
+        return np.asarray(result[self.output_model.output(0)], dtype=np.float32).copy()

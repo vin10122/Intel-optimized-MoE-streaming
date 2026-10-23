@@ -24,6 +24,7 @@ from typing import Any, Iterable, Iterator
 import threading
 
 from .key import ExpertKey, StoreStats
+from .store import AsyncPrefetchMixin
 
 
 class MemoryMappedGGUF:
@@ -216,101 +217,21 @@ class MemoryMappedExpertStore:
         return tuple(self._cache)
 
 
-class MemoryMappedAsyncExpertStore(MemoryMappedExpertStore):
-    """Store con memory-mapped I/O e prefetch asincrono."""
+class MemoryMappedAsyncExpertStore(AsyncPrefetchMixin, MemoryMappedExpertStore):
+    """Memory-mapped reads with the same bounded, synchronized cache policy."""
 
     DEFAULT_WORKERS = 8
 
-    def __init__(self, root: str | Path, capacity: int = 2, manifest: Any = None,
-                 workers: int | None = None):
+    def __init__(self, root, capacity=2, manifest=None, workers=None):
         super().__init__(root, capacity, manifest)
-        if workers is not None and workers < 1:
-            raise ValueError(f"workers must be at least 1, got {workers}")
-        self.workers = self.DEFAULT_WORKERS if workers is None else workers
-        self.executor = ThreadPoolExecutor(max_workers=self.workers)
-        self.pending_loads: dict[ExpertKey, Future] = {}
+        self._init_async(workers)
 
-    def prefetch(self, key: ExpertKey) -> None:
-        if key in self._cache or key in self.pending_loads:
-            return
-        if self.manifest is None and not self._path_for(key).exists():
-            return
-        self.pending_loads[key] = self.executor.submit(self._read_expert, key)
+    def _read_expert(self, key):
+        # Mapping creation must not race between reader threads.
+        with self._cache_lock:
+            self._get_gguf_map()
+        return super()._read_expert(key)
 
-    def prefetch_many(self, keys: Iterable[ExpertKey]) -> int:
-        queued = 0
-        for key in keys:
-            if key in self._cache or key in self.pending_loads:
-                continue
-            if self.manifest is None and not self._path_for(key).exists():
-                continue
-            self.pending_loads[key] = self.executor.submit(self._read_expert, key)
-            queued += 1
-        return queued
-
-    def _consume(self, key: ExpertKey) -> dict[str, bytes] | None:
-        future = self.pending_loads.pop(key, None)
-        if future is None:
-            return None
-        try:
-            tensors = future.result()
-        except Exception:
-            return None
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)
-
-    def read_all(self, key: ExpertKey) -> dict[str, bytes]:
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            return cached
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            return prefetched
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)
-
-    def read_tensor(self, key: ExpertKey, name: str) -> bytes:
-        if self.manifest is None:
-            raise ValueError("read_tensor requires a manifest with tensor slices")
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            self.stats.tensor_reads += 1
-            return cached[name]
-
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            self.stats.tensor_reads += 1
-            return prefetched[name]
-
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.tensor_reads += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return self._admit(key, tensors)[name]
-
-    def get(self, key: ExpertKey) -> bytes:
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            self.stats.hits += 1
-            return b"".join(cached.values())
-        prefetched = self._consume(key)
-        if prefetched is not None:
-            self.stats.prefetch_hits += 1
-            return b"".join(prefetched.values())
-        tensors = self._read_expert(key)
-        self.stats.misses += 1
-        self.stats.bytes_read += sum(len(v) for v in tensors.values())
-        return b"".join(self._admit(key, tensors).values())
-
-    def close(self) -> None:
+    def close(self):
         self.executor.shutdown(wait=True)
         super().close()

@@ -17,11 +17,11 @@ softmax su 256 numeri per averne 8.
 
 Sul f16
 -------
-I gate sono 2048x256 per layer, 40 layer: 42M parametri, 84 MiB in f16
-contro 168 MiB in f32. Il prodotto however si fa in f32 e il confronto
-degli score anche: in f16 due expert su 256 possono risultare pari e
-``argsort`` ne sceglie uno a caso, il che riproduce esattamente il difetto
-che rende il routing non deterministico fra due run.
+I gate sono 2048x256 per layer, 40 layer: 20.97M parametri. Si preserva
+prima l'arrotondamento scelto da gate_dtype, poi si conserva una sola copia
+f32 (80 MiB invece di 40 MiB f16). Il prodotto e il confronto degli score
+restano f32: la promozione una volta sola evita conversioni per ogni token
+senza modificare i valori arrotondati usati dal routing precedente.
 """
 
 from __future__ import annotations
@@ -52,9 +52,11 @@ class ExpertRouter:
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts)
         self.gate_dtype = np.dtype(gate_dtype)
-        self.gate_weights = self._normalize_gate(
+        # Preserve the configured rounding, then promote once rather than
+        # allocating a new FP32 matrix for every routed token.
+        self.gate_weights = np.asarray(self._normalize_gate(
             gate_weights, hidden_size, num_experts, self.gate_dtype
-        )
+        ), dtype=np.float32)
 
     @staticmethod
     def _normalize_gate(

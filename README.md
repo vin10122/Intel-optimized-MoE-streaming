@@ -35,12 +35,41 @@ The first model tested was **Hermes 3.6 35B A3B**, a Qwen3.6-MoE-based model
 in GGUF format. The model file is not included in this repository; you need
 to obtain it separately.
 
-Manual end-to-end runs on an **Intel Core Ultra 5 226V with integrated Intel
-Arc 130V graphics** produced understandable answers. In three recent runs,
-generation measured **1.081, 1.231, and 1.304 tokens per second**. The prompts
-contained 91, 91, and 86 tokens; their prefill times were **55.1, 42.0, and
-40.9 seconds**, respectively. These are indicative results, not a controlled
-benchmark: performance varies with the prompt, answer length, and cache state.
+The current configuration combines **native quantized CPU decode with two
+expert workers**, OpenVINO expert prefill with four CPU threads, batched
+DeltaNet projections on the GPU, a sliding eight-expert prefetch window,
+and router weights promoted to FP32 once per layer. The recurrence and its
+state remain sequential FP32 operations. Raw expert cache: **320**; converted
+weight cache: **1**. Native batched expert prefill was tested and excluded
+because the complete prompt ran slower.
+
+Manual runs used an **Intel Core Ultra 5 226V, integrated Arc 130V graphics,
+15.7 GiB usable RAM, and Python 3.14 on Windows**:
+
+| Power / request | Prompt tokens | Prefill | Generated tokens | Generation time | Generation speed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Battery, first request | 88 | 57.0 s | 95 | 101.7 s | 0.934 tok/s |
+| AC adapter, first request | 88 | 43.1 s | 95 | 82.8 s | 1.148 tok/s |
+| AC adapter, repeated request in the same process | 88 | 22.8 s | 95 | 55.8 s | 1.702 tok/s |
+| AC adapter, different question in the same process | 81 | 22.7 s | 94 | 56.1 s | 1.677 tok/s |
+
+**Connecting the AC adapter improved the observed performance.** Comparing
+the two first requests, prefill fell by about 24% and generation speed rose
+by about 23%. These are observations from manual runs, not a controlled
+power benchmark. Compilation, OS file cache, power settings, temperature,
+and prompt routing also affect the results. The faster repeated request
+benefits from warm-up as well; do not attribute its entire gain to AC power.
+For comparisons, keep the power source and performance mode consistent and
+report first-request and warmed-request timings separately.
+
+These measurements came from the temporary version of the same kernels and
+execution policy integrated here. Full-model measurements of this final
+integration still need to be repeated on the target Windows PC. A native
+decode comparison matched 16 greedy token IDs; four forced-input logits
+checks had maximum relative error below 0.0006. The same 95-token answer
+was observed with the optimized DeltaNet prefill. This is a numerical smoke
+check, not proof of general answer-quality parity. The first generated token
+comes from prefill logits: a one-token run does **not** measure decode speed.
 
 Automated tests check individual components such as attention,
 dequantization, and the DeltaNet path. They are not a full validation of
@@ -107,11 +136,13 @@ Enter a prompt after the `>` symbol. To exit, type `/esce` or press
 
 The preset runs the main model on the CPU and uses the Intel GPU for DeltaNet
 projections and full attention. If the GPU or its driver is unavailable, use
-`--ssm-device CPU --attention-device CPU` instead.
+`--ssm-device CPU --attention-device CPU` instead, including after `default`.
 
 The `default` preset selects CPU for the main device, GPU for DeltaNet and
-full-attention projections, cache sizes of 320 and 384, deterministic
-sampling, and a 512-token maximum. Append a prompt after `default` for a
+full-attention projections, cache sizes of 320 and 1, deterministic
+sampling, and a 128-token maximum. It uses native expert decode automatically
+when the CPU and compiled DLL support it; otherwise it reports an OpenVINO
+fallback. Explicit command-line flags override the preset. Append a prompt after `default` for a
 one-shot run.
 
 The assistant is instructed to keep its answers concise. `--max-tokens` is
@@ -121,7 +152,9 @@ answer may be incomplete; in that case, raise the limit further.
 
 After each answer, the program reports generated tokens per second, prompt
 processing time, and some cache statistics. Initial model loading may take
-a long time.
+a long time. Logical read bytes and cache counters in the footer are
+cumulative for the process; they do not measure physical SSD traffic. Each
+question currently starts a fresh model context, retaining reusable caches.
 
 ### Useful options
 
@@ -131,11 +164,36 @@ a long time.
   answer.
 - `--cache 320`: limits how many quantized expert weight groups to keep in
   memory.
-- `--weight-cache 384`: limits how many converted expert weight groups to
-  keep in memory. Lowering this value may help if the PC is short on RAM.
+- `--weight-cache 1`: limits how many converted expert weight groups to
+  keep in memory. The recommended value is 1 for the measured native-decode
+  configuration; larger values can consume substantial RAM.
 - `--temp 0`: uses deterministic token selection; higher values introduce
   more variation.
 - `--max-seq 512`: sets the maximum supported context length.
+
+## Build the native decode kernel
+
+Install Visual Studio Build Tools with the x64 C++ tools, then run from
+PowerShell in the project root:
+
+```powershell
+scripts\compile_dequant_k.bat
+scripts\compile_native_expert.bat
+py -3.14 chat.py default --native-decode native
+```
+
+The first DLL accelerates weight conversion during prefill. The second
+(`src/flash_moe/moe_quant_dot.dll`) reads quantized expert weights directly
+during single-token decode, avoiding full FP16 expert materialization. It
+requires AVX2, FMA and F16C and supports Q8_0, Q3_K, Q4_K, Q5_K and Q6_K.
+The build does not replace the weight-conversion DLL. Binaries and model
+files are excluded from Git; each Windows installation builds its own DLLs.
+
+`--native-decode native` requires the kernel and reports an error if it
+cannot be used. The default `auto` falls back to OpenVINO if unavailable;
+`--native-decode openvino` explicitly selects the reference expert path.
+The prefill uses OpenVINO in all three modes. `--expert-workers 2` and
+`--prefill-threads 4` expose the measured thread settings for other PCs.
 
 ## Optional C++ weight-conversion acceleration
 
@@ -156,6 +214,7 @@ require the DLL.
 Tests are Python scripts. For example, run these from the project root:
 
 ```powershell
+py -3.14 tools\test_optimized_inference.py
 py -3.14 tools\test_attention.py
 py -3.14 tools\test_gated_deltanet_real.py
 ```

@@ -305,7 +305,27 @@ class GatedDeltaNetLayer:
             )
 
         qkv, z, beta, alpha = self._projections(x)
+        flat = self._recurrent_step(qkv, z, beta, alpha)
+        if self.projections is not None:
+            return self.projections.output_projection(flat)
+        return flat @ self.f32("out").T
 
+    def forward_sequence(self, values):
+        """Batch GPU projections, preserving sequential FP32 state updates."""
+        values = np.asarray(values, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != self.hidden_size:
+            raise ValueError("DeltaNet input must be (tokens, hidden_size)")
+        if self.projections is None or len(values) <= 1:
+            return np.asarray([self.forward(x) for x in values], dtype=np.float32).reshape(-1, self.hidden_size)
+        qkv, gates = self.projections.inputs_many(values)
+        gathered = np.empty((len(values), self.n_v_heads * self.head_v_dim), np.float32)
+        for index, x in enumerate(values):
+            beta = _sigmoid(x @ self.small["beta"].T)
+            alpha = x @ self.small["alpha"].T
+            gathered[index] = self._recurrent_step(qkv[index], gates[index], beta, alpha)
+        return self.projections.output_many(gathered)
+
+    def _recurrent_step(self, qkv, z, beta, alpha):
         # gate: ssm_a contiene gia' -exp(A_log), quindi basta il softplus
         # moltiplicato, non un exp in piu'.
         gate = _softplus(alpha + self.small["dt_bias"]) * self.small["a"]
@@ -374,14 +394,7 @@ class GatedDeltaNetLayer:
             np.mean(head_out * head_out, axis=-1, keepdims=True) + eps))
         gated = rms * norm_w * _silu(z)
 
-        flat = gated.reshape(-1)
-        # ssm_out e' l'unico peso SSM la cui memoria e' gia' (n_out, n_in)
-        # senza particolarita': il verso giusto e' il trasposto della forma
-        # del GGUF, fatto una volta sola in load_layer_weights. Qui il
-        # prodotto e' flat @ out.T, che BLAS esegue sulla vista.
-        if self.projections is not None:
-            return self.projections.output_projection(flat)
-        return flat @ self.f32("out").T
+        return gated.reshape(-1)
 
 
 def is_recurrent_layer(tensor_map: dict, layer: int) -> bool:

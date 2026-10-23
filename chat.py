@@ -12,21 +12,18 @@ a uno, che e' il punto di tutto il progetto.
 
 Su ``--cache`` e ``--weight-cache``. La prima tiene in RAM i byte quantizzati
 letti dal GGUF; la seconda i pesi f16 già convertiti. I default sono 320 raw
-e 384 convertiti: il test ha ridotto i miss di conversione da 777 a 623 su
-quattro passi, mentre 448 non li ha ridotti ulteriormente. 640 pesi convertiti
-hanno causato paging in prove precedenti. Per disabilitare entrambe le cache
-imposta entrambi i parametri a 1. Le cache non cambiano i numeri, solo quante
-volte si rileggono o riconvertono i pesi.
+e 1 convertito. Il decode nativo legge i byte quantizzati direttamente e
+non conserva pesi expert f16. Le cache cambiano il lavoro di lettura e
+conversione, non i valori dei pesi.
 
 Su ``--device``. Il default e' CPU. GPU e NPU sono selezionabili, ma le
 misure end-to-end dipendono da memoria disponibile, cache e dispositivo.
 
 Su ``--ssm-device``. Sposta le proiezioni grandi del DeltaNet su OpenVINO
-CPU/GPU/NPU in f16; ricorrenza e stato restano in f32 su CPU. Senza opzione
-il percorso resta NumPy/CPU.
+CPU/GPU/NPU in f16; ricorrenza e stato restano in f32 su CPU. Default GPU.
 
 Su ``--attention-device``. Sposta le proiezioni Q/K/V e output della full
-attention su OpenVINO FP16. Senza opzione il percorso resta NumPy/CPU.
+attention su OpenVINO FP16. Default GPU.
 """
 from __future__ import annotations
 
@@ -109,6 +106,7 @@ class LiveProfiler:
         wrap(model.backend, "_decode", "dequant/view pesi (sottofase pesi)")
         wrap(model.store, "read_tensor", "lettura raw (sottofase pesi)")
         wrap(model.backend, "_infer", "expert OpenVINO (sottofase MoE)")
+        wrap(model.backend, "_native_forward", "expert nativo (sottofase MoE)")
         if model.shared_expert is not None:
             wrap(model.shared_expert, "forward", "shared expert (sottofase MoE)")
 
@@ -152,7 +150,8 @@ class LiveProfiler:
                   f"{counts.get('weight-cache hit', 0)} hit, "
                   f"{counts.get('weight-cache miss', 0)} miss")
         print("    Nota: lettura/dequant sono comprese nel percorso pesi; "
-              "pesi, inferenza e shared sono comprese in MoE totale.")
+              "pesi, inferenza e shared sono comprese in MoE totale. "
+              "Le durate dei worker paralleli possono sovrapporsi.")
 
 
 def encode_user_turn(tok: GGUFTokenizer, prompt: str) -> list[int]:
@@ -189,11 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attention-device", default="GPU", choices=("CPU", "GPU", "NPU"),
                         help="dispositivo OpenVINO per le proiezioni full "
                              "attention FP16. Default: GPU (con XMX).")
-    parser.add_argument("--max-tokens", type=int, default=512,
-                        help="token massimi da generare. Default 512.")
-    parser.add_argument("--temp", type=float, default=0.7,
+    parser.add_argument("--max-tokens", type=int, default=128,
+                        help="token massimi da generare. Default 128.")
+    parser.add_argument("--temp", type=float, default=0.0,
                         help="temperatura del campionamento. 0 = greedy. "
-                             "Default 0.7.")
+                             "Default 0 (greedy).")
     parser.add_argument("--top-k", type=int, default=20,
                         help="candidati tenuti prima di top_p. Default 20.")
     parser.add_argument("--top-p", type=float, default=0.95,
@@ -203,10 +202,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache", type=int, default=320,
                         help="expert grezzi quantizzati tenuti in RAM. "
                              "Default 320.")
-    parser.add_argument("--weight-cache", type=int,
+    parser.add_argument("--weight-cache", type=int, default=1,
                         help="pesi expert convertiti tenuti in RAM; "
-                             "default 384. Imposta 1 insieme a --cache 1 "
+                             "default 1. Imposta 1 insieme a --cache 1 "
                              "per riconvertire ogni volta.")
+    parser.add_argument("--native-decode", choices=("auto", "native", "openvino"),
+                        default="auto", help="Kernel expert CPU: auto usa la DLL "
+                        "se disponibile; native la richiede; openvino la disabilita.")
+    parser.add_argument("--expert-workers", type=int, default=2,
+                        help="Worker expert nel decode. Default 2.")
+    parser.add_argument("--prefill-threads", type=int, default=4,
+                        help="Thread OpenVINO CPU per gruppi di token. Default 4.")
     parser.add_argument("--max-seq", type=int, default=512,
                         help="lunghezza massima del contesto. Default 512.")
     parser.add_argument("--preload", action="store_true",
@@ -237,7 +243,7 @@ def footer(model: Qwen3MoEModel, eos: bool, token_limit_reached: bool,
         f"prefill {prompt_tokens} token in {prefill_seconds:.1f} s "
         f"({prefill_rate:.2f} tok/s)"
     )
-    bits.append(f"{stats.bytes_read / 2**20:.0f} MiB letti dal disco")
+    bits.append(f"{stats.bytes_read / 2**20:.0f} MiB di letture logiche cumulative")
     bits.append(f"{stats.misses} cache miss, {stats.prefetch_hits} prefetch")
     bits.append(f"{len(model.store.resident_keys())} expert in RAM")
     return " | " + " | ".join(bits)
@@ -282,8 +288,11 @@ def ask(model: Qwen3MoEModel, tok: GGUFTokenizer, prompt: str,
             step_seconds = generation_seconds - previous_generation_seconds
             previous_generation_seconds = generation_seconds
             rate = 1.0 / step_seconds if step_seconds > 0 else float("inf")
-            print(f"\n  [token {produced}] {step_seconds:.3f} s "
-                  f"({rate:.3f} tok/s)")
+            if produced == 1:
+                print(f"\n  [token 1] sampling dopo prefill: {step_seconds:.3f} s")
+            else:
+                print(f"\n  [token {produced}] {step_seconds:.3f} s "
+                      f"({rate:.3f} tok/s)")
             if produced == 1:
                 print(f"    prefill: {timings['prefill_seconds']:.3f} s "
                       "(misurato a parte)")
@@ -319,9 +328,10 @@ def ask(model: Qwen3MoEModel, tok: GGUFTokenizer, prompt: str,
         f"\nprompt: {timings['prompt_tokens']} token, "
         f"prefill {timings['prefill_seconds']:.1f} s"
     )
+    speed = f"{tok_s:.3f} tok/s" if n > 1 else "velocita decode non misurabile"
     print(
         f"generazione: {n} token in {generation_seconds:.1f} s "
-        f"({tok_s:.3f} tok/s; prefill escluso)"
+        f"({speed}; prefill escluso)"
     )
     prompt_tokens = int(timings["prompt_tokens"])
     prefill_seconds = float(timings["prefill_seconds"])
@@ -333,17 +343,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.prompt and args.prompt[0].casefold() == "default":
         args.prompt = args.prompt[1:]
-        args.device = "CPU"
-        args.ssm_device = "GPU"
-        args.attention_device = "GPU"
-        args.cache = 320
-        args.weight_cache = 384
-        args.max_tokens = 512
-        args.temp = 0.0
+        # Parser defaults are the measured preset. Explicit flags win.
     if args.cache < 1:
         raise ValueError("--cache deve essere positivo")
     if args.weight_cache is not None and args.weight_cache < 1:
         raise ValueError("--weight-cache deve essere positivo")
+    if min(args.expert_workers, args.prefill_threads) < 1:
+        raise ValueError("worker e thread devono essere positivi")
     if args.max_tokens < 1:
         raise ValueError("--max-tokens deve essere positivo")
     if args.temp <= 0.0:
@@ -372,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     print("https://github.com/vin10122/MoE-ssd-streaming-for-openVINO",
           flush=True)
     print(f"Cache: {args.cache} raw experts, "
-          f"{args.weight_cache or 384} converted weights | DeltaNet: "
+          f"{args.weight_cache} converted weights | DeltaNet: "
           f"{args.ssm_device or 'NumPy/CPU'} | Full attention: "
           f"{args.attention_device or 'NumPy/CPU'}", flush=True)
     startup_progress(0, f"Loading {path.name} on {args.device}")
@@ -382,7 +388,10 @@ def main(argv: list[str] | None = None) -> int:
         model = Qwen3MoEModel(
             path, device=args.device, max_seq_len=args.max_seq,
             cache_capacity=args.cache, dequant_fn=dequant_to_f16,
-            weight_cache_capacity=args.weight_cache or 384,
+            weight_cache_capacity=args.weight_cache,
+            native_decode=args.native_decode,
+            expert_workers=args.expert_workers,
+            prefill_threads=args.prefill_threads,
             ssm_device=args.ssm_device,
             attention_device=args.attention_device,
             use_mmap=args.mmap,
@@ -418,9 +427,15 @@ def main(argv: list[str] | None = None) -> int:
                     model.store.prefetch(key)
                     experts_loaded += 1
 
-            import time as time_module
-            while len(model.store.pending_loads) > 0:
-                time_module.sleep(0.1)
+            # Prefetch admission is intentionally bounded; consume each
+            # selected expert rather than waiting for an unconsumed queue.
+            remaining = min(args.cache, model.block_count * model.top_k)
+            for layer in range(model.block_count):
+                for expert_idx in range(model.top_k):
+                    if remaining <= 0:
+                        break
+                    model.store.read_all(ExpertKey(layer, expert_idx % num_experts))
+                    remaining -= 1
             preload_time = time.perf_counter() - preload_start
             print(f"Expert preload completed in {preload_time:.1f}s.",
                   flush=True)
