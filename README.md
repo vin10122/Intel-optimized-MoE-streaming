@@ -78,20 +78,19 @@ The latest tests below were **all run with the AC adapter connected**, on
 that same Intel PC, using four expert workers, raw cache 320 and converted
 cache 1. They used temporary launchers with the kernels now integrated here:
 
-| Prompt / run | Prompt tokens | Prefill | Generated tokens | Generation time | CLI rate | Decode-step rate, approximately |
+| Run | Input tokens | Prefill | Generated tokens | Generation time | CLI rate | Decode-step rate, approximately |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| DAS explanation, first request with checks | 101 | 32.4 s | 64 | 31.9 s | 2.004 tok/s | 1.97 tok/s |
-| Nuclear plant explanation, same session | 98 | 26.6 s | 64 | 31.8 s | 2.010 tok/s | 1.98 tok/s |
-| Longer nuclear plant answer, new session | 117 | 32.2 s | 351 | 186.9 s | 1.878 tok/s | 1.87 tok/s |
+| First request with checks | 101 | 32.4 s | 64 | 31.9 s | 2.004 tok/s | 1.97 tok/s |
+| Second request, same session | 98 | 26.6 s | 64 | 31.8 s | 2.010 tok/s | 1.98 tok/s |
+| Longer generation, new session | 117 | 32.2 s | 351 | 186.9 s | 1.878 tok/s | 1.87 tok/s |
 
 The approximate decode-step rate uses `(generated_tokens - 1) / generation_time`,
 because the first token comes from prefill. The timer also includes sampling
 and, on the first request, temporary numerical checks/microbenchmarks. These
 are manual observations with varying cache and thermal conditions; **stable
 2+ tok/s has not been established**. The long test used a 512-token output
-limit and stopped at EOS after 351 tokens. Only the first paragraph of the
-proposed multiline prompt was submitted: it was a long answer, not a long
-input-context test. The current interactive CLI submits one line at a time.
+limit and stopped at EOS after 351 tokens. Its input contained 117 tokens,
+so this measures sustained generation rather than long-context performance.
 
 The Q3_K kernel extracts signed values before widening to AVX2 32-bit lanes
 and uses constant shifts, retaining the original FMA accumulation order and
