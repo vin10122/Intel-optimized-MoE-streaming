@@ -114,6 +114,7 @@ class GatedDeltaNetLayer:
                  eps: float = 1e-6, keep_f32: bool = False,
                  projection_device: str | None = None) -> None:
         self.layer_idx = layer_idx
+        self.native_delta = None
         self.w = weights
         self.hidden_size = hidden_size
         self.n_v_heads = n_v_heads
@@ -381,10 +382,13 @@ class GatedDeltaNetLayer:
         # sola per testa: chiamarla due volte applicherebbe il delta rule due
         # volte sullo stesso token. self.state[h] e' una vista, quindi la
         # scrittura aggiorna lo stato persistente.
-        head_out = np.empty((self.n_v_heads, self.head_v_dim), dtype=np.float32)
-        for h in range(self.n_v_heads):
-            head_out[h] = self._delta_step(self.state[h], q[h], k[h], v[h],
-                                           float(beta[h]), float(gate[h]))
+        if self.native_delta is not None:
+            head_out = self.native_delta.forward(self.state, q, k, v, beta, gate)
+        else:
+            head_out = np.empty((self.n_v_heads, self.head_v_dim), dtype=np.float32)
+            for h in range(self.n_v_heads):
+                head_out[h] = self._delta_step(self.state[h], q[h], k[h], v[h],
+                                               float(beta[h]), float(gate[h]))
 
         # gated RMSNorm: rmsnorm(out) * silu(z), z alla forma dei value-head.
         z = z.reshape(self.n_v_heads, self.head_v_dim)

@@ -15,7 +15,7 @@ if not defined VCVARS (
 call "%VCVARS%" >nul
 if errorlevel 1 exit /b 1
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
-cl /nologo /EHsc /O2 /arch:AVX2 /LD /W3 ^
+cl /nologo /EHsc /O2 /arch:AVX2 /fp:precise /LD /W3 ^
     /I"%REPO_DIR%\cpp" ^
     /Fo"%BUILD_DIR%\moe_quant_dot.obj" ^
     /Fd"%BUILD_DIR%\moe_quant_dot.pdb" ^

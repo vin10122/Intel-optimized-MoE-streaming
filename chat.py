@@ -209,8 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--native-decode", choices=("auto", "native", "openvino"),
                         default="auto", help="Kernel expert CPU: auto usa la DLL "
                         "se disponibile; native la richiede; openvino la disabilita.")
-    parser.add_argument("--expert-workers", type=int, default=2,
-                        help="Worker expert nel decode. Default 2.")
+    parser.add_argument("--expert-workers", type=int, default=4,
+                        help="Worker expert nel decode. Default 4.")
     parser.add_argument("--prefill-threads", type=int, default=4,
                         help="Thread OpenVINO CPU per gruppi di token. Default 4.")
     parser.add_argument("--max-seq", type=int, default=512,

@@ -160,6 +160,45 @@ class OptimizedInferenceTests(unittest.TestCase):
         self.assertEqual(events, ["prefill", "reset", "decode"] * 2)
 
     @unittest.skipUnless(NATIVE_PATH.is_file(), "compiled native kernel not configured")
+    def test_native_deltanet_state_over_changing_inputs(self):
+        native = NativeExpert(NATIVE_PATH).delta
+        if native is None:
+            self.skipTest("rebuild native DLL for DeltaNet checks")
+        for nv, dv, dk in ((32, 128, 128), (3, 7, 9)):
+            state = self.rng.standard_normal((nv, dv, dk)).astype(np.float32) * .01
+            reference = SimpleNamespace(state=state.copy(), head_v_dim=dv,
+                                        _kv_buf=np.empty(max(dk, dv), np.float32))
+            actual = state.copy()
+            for _ in range(40):
+                q = self.rng.standard_normal((nv, dk)).astype(np.float32) * .05
+                k = self.rng.standard_normal((nv, dk)).astype(np.float32) * .05
+                v = self.rng.standard_normal((nv, dv)).astype(np.float32) * .1
+                beta = self.rng.uniform(.01, .99, nv).astype(np.float32)
+                gate = -self.rng.uniform(.001, 5, nv).astype(np.float32)
+                want = np.stack([GatedDeltaNetLayer._delta_step(
+                    reference, reference.state[h], q[h], k[h], v[h],
+                    float(beta[h]), float(gate[h])) for h in range(nv)])
+                got = native.forward(actual, q, k, v, beta, gate)
+                np.testing.assert_allclose(got, want, atol=1e-7, rtol=.0001)
+                np.testing.assert_allclose(actual, reference.state, atol=1e-7, rtol=.0001)
+        # The model selects the native recurrence for decode only and always
+        # clears the temporary layer reference, including after failures.
+        layer = SimpleNamespace(native_delta=None)
+        observed = []
+        def sequence(values):
+            observed.append(layer.native_delta)
+            return values
+        layer.forward_sequence = sequence
+        model = SimpleNamespace(backend=SimpleNamespace(
+            native_expert=SimpleNamespace(delta=native), _native_enabled=False))
+        x = np.zeros((1, 3, 16), np.float32)
+        Qwen3MoEModel._run_ssm(model, layer, x)
+        model.backend._native_enabled = True
+        Qwen3MoEModel._run_ssm(model, layer, x[:, :1])
+        self.assertEqual(observed, [None, native])
+        self.assertIsNone(layer.native_delta)
+
+    @unittest.skipUnless(NATIVE_PATH.is_file(), "compiled native kernel not configured")
     def test_native_quantizations_and_concurrency(self):
         import gguf
         native = NativeExpert(NATIVE_PATH)

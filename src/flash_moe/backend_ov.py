@@ -7,7 +7,7 @@ Scelte dettate da misure (tools/check_share_weights.py, tools/check_ov_precision
   6e+19 su CPU. Con ``numpy`` ``float16`` nativo l'errore relativo e' 3,8e-04.
 * **Un request per thread e shape**: i worker riusano request indipendenti.
   Il prefill usa un grafo con numero di token dinamico e quattro thread CPU;
-  il decode OpenVINO usa un thread per expert e due worker di default.
+  il decode OpenVINO usa un thread per expert e quattro worker di default.
 * **Device di default = CPU.** Con i pesi passati a ogni chiamata il plugin GPU
   gira a 1,05 GB/s contro i 5,25 GB/s del plugin CPU, e finisce 5x piu' lento.
   Su 320 GEMM da 4 MFLOP il trasferimento dei pesi domina il compute, e
@@ -104,7 +104,7 @@ class OpenVINOExpertBackend:
                  tensor_types: dict[int, dict[str, int]] | None = None,
                  dequant_fn: Any = None,
                  inference_threads: int = 1, prefill_threads: int = 4,
-                 expert_workers: int = 2, native_decode: str = "auto",
+                 expert_workers: int = 4, native_decode: str = "auto",
                  native_library=None) -> None:
         self.store = store
         self.core = ov.Core()

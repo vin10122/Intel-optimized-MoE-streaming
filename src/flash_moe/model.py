@@ -52,7 +52,7 @@ class Qwen3MoEModel:
         startup_progress: Callable[[int, str], None] | None = None,
         native_decode: str = "auto",
         native_library: Path | None = None,
-        expert_workers: int = 2,
+        expert_workers: int = 4,
         prefill_threads: int = 4,
     ) -> None:
         startup_phase_started = time.perf_counter()
@@ -540,7 +540,13 @@ class Qwen3MoEModel:
             raise ValueError(
                 f"il delta net ha stato singolo: batch {b} non supportato, "
                 "perche' le due sequenze condividerebbero lo stesso stato")
-        return layer.forward_sequence(x[0]).reshape(b, s, h)
+        expert = self.backend.native_expert
+        layer.native_delta = (getattr(expert, "delta", None)
+                              if self.backend._native_enabled else None)
+        try:
+            return layer.forward_sequence(x[0]).reshape(b, s, h)
+        finally:
+            layer.native_delta = None
 
     def init_caches(self) -> None:
         self.backend.begin_prefill()

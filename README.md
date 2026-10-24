@@ -35,10 +35,11 @@ The first model tested was **Hermes 3.6 35B A3B**, a Qwen3.6-MoE-based model
 in GGUF format. The model file is not included in this repository; you need
 to obtain it separately.
 
-The current configuration combines **native quantized CPU decode with two
+The current configuration combines **native quantized CPU decode with four
 expert workers**, OpenVINO expert prefill with four CPU threads, batched
 DeltaNet projections on the GPU, a sliding eight-expert prefetch window,
-and router weights promoted to FP32 once per layer. The recurrence and its
+router weights promoted to FP32 once per layer, and native FP32 DeltaNet
+recurrence during decode. The recurrence and its
 state remain sequential FP32 operations. Raw expert cache: **320**; converted
 weight cache: **1**. Native batched expert prefill was tested and excluded
 because the complete prompt ran slower.
@@ -62,14 +63,55 @@ benefits from warm-up as well; do not attribute its entire gain to AC power.
 For comparisons, keep the power source and performance mode consistent and
 report first-request and warmed-request timings separately.
 
-These measurements came from the temporary version of the same kernels and
-execution policy integrated here. Full-model measurements of this final
+The earlier measurements above came from the first temporary native-decode
+configuration; the newer Q3_K/DeltaNet results are recorded below. Full-model measurements of this final
 integration still need to be repeated on the target Windows PC. A native
 decode comparison matched 16 greedy token IDs; four forced-input logits
 checks had maximum relative error below 0.0006. The same 95-token answer
 was observed with the optimized DeltaNet prefill. This is a numerical smoke
 check, not proof of general answer-quality parity. The first generated token
 comes from prefill logits: a one-token run does **not** measure decode speed.
+
+### Q3_K and DeltaNet update: all new measurements on AC power
+
+The latest tests below were **all run with the AC adapter connected**, on
+that same Intel PC, using four expert workers, raw cache 320 and converted
+cache 1. They used temporary launchers with the kernels now integrated here:
+
+| Prompt / run | Prompt tokens | Prefill | Generated tokens | Generation time | CLI rate | Decode-step rate, approximately |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| DAS explanation, first request with checks | 101 | 32.4 s | 64 | 31.9 s | 2.004 tok/s | 1.97 tok/s |
+| Nuclear plant explanation, same session | 98 | 26.6 s | 64 | 31.8 s | 2.010 tok/s | 1.98 tok/s |
+| Longer nuclear plant answer, new session | 117 | 32.2 s | 351 | 186.9 s | 1.878 tok/s | 1.87 tok/s |
+
+The approximate decode-step rate uses `(generated_tokens - 1) / generation_time`,
+because the first token comes from prefill. The timer also includes sampling
+and, on the first request, temporary numerical checks/microbenchmarks. These
+are manual observations with varying cache and thermal conditions; **stable
+2+ tok/s has not been established**. The long test used a 512-token output
+limit and stopped at EOS after 351 tokens. Only the first paragraph of the
+proposed multiline prompt was submitted: it was a long answer, not a long
+input-context test. The current interactive CLI submits one line at a time.
+
+The Q3_K kernel extracts signed values before widening to AVX2 32-bit lanes
+and uses constant shifts, retaining the original FMA accumulation order and
+FP16 rounding. All tested Q3 expert samples from layers 5–34 matched the old
+native kernel bit for bit. A same-expert Windows microbenchmark measured
+1.502 to 0.750 ms (2.00x); another measured 1.390 to 0.607 ms (2.29x).
+These single-expert ratios are **not** whole-model speedups.
+
+The DeltaNet kernel processes all value heads in one native call, leaving
+convolution, normalization, projection devices and token recurrence order
+unchanged. Target-PC checks compared local outputs, recurrent state and
+convolution state with the previous path, with observed maximum relative
+errors below 5e-7. This does not prove general answer-quality parity.
+The native recurrence is enabled only after prefill; OpenVINO/NumPy prefill
+is retained. `--native-decode openvino` also retains the NumPy recurrence.
+
+A larger raw cache of 640 was rejected: in one 32-token diagnostic run,
+generation increased from 18.1 to 24.0 seconds. Cache misses, logical read
+bytes and physical storage traffic are different quantities; zero demand
+misses does not imply no prefetch waits or memory pressure.
 
 Automated tests check individual components such as attention,
 dequantization, and the DeltaNet path. They are not a full validation of
@@ -169,7 +211,9 @@ question currently starts a fresh model context, retaining reusable caches.
   configuration; larger values can consume substantial RAM.
 - `--temp 0`: uses deterministic token selection; higher values introduce
   more variation.
-- `--max-seq 512`: sets the maximum supported context length.
+- `--max-seq 512`: sets the maximum supported context length. For a larger
+  context, for example use `--max-seq 2048 --max-tokens 512`. This increases
+  context capacity; it does not force the model to generate 512 tokens.
 
 ## Build the native decode kernel
 
@@ -182,17 +226,24 @@ scripts\compile_native_expert.bat
 py -3.14 chat.py default --native-decode native
 ```
 
+After updating the C++ sources, close running chats and rebuild with
+`scripts\compile_native_expert.bat`; a DLL built before this update does not
+contain the new Q3_K code or DeltaNet entry point. Recompilation is not
+needed merely because you reopened PowerShell. Startup reports whether the
+native DeltaNet entry point is present; older DLLs retain NumPy recurrence.
+
 The first DLL accelerates weight conversion during prefill. The second
 (`src/flash_moe/moe_quant_dot.dll`) reads quantized expert weights directly
 during single-token decode, avoiding full FP16 expert materialization. It
 requires AVX2, FMA and F16C and supports Q8_0, Q3_K, Q4_K, Q5_K and Q6_K.
+The same native DLL also contains the FP32 DeltaNet recurrence kernel.
 The build does not replace the weight-conversion DLL. Binaries and model
 files are excluded from Git; each Windows installation builds its own DLLs.
 
 `--native-decode native` requires the kernel and reports an error if it
 cannot be used. The default `auto` falls back to OpenVINO if unavailable;
 `--native-decode openvino` explicitly selects the reference expert path.
-The prefill uses OpenVINO in all three modes. `--expert-workers 2` and
+The prefill uses OpenVINO in all three modes. `--expert-workers 4` and
 `--prefill-threads 4` expose the measured thread settings for other PCs.
 
 ## Optional C++ weight-conversion acceleration

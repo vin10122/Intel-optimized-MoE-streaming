@@ -22,6 +22,21 @@ static inline bool decode_block(int type, const uint8_t* src, float* tmp) {
 
 // Q3_K layout follows gguf.quants.Q3_K.dequantize_blocks: eight groups
 // of 32, each split into two scale groups of 16. Decode directly in AVX2.
+template<int Group, int J>
+static inline __m256 q3_part(const uint8_t* blk, const float* x,
+                             const float* scales, __m256 sum, bool rounding) {
+    const __m128i low = _mm_loadl_epi64((const __m128i*)(blk + 32 + (Group / 4)*32 + J));
+    const __m128i high = _mm_loadl_epi64((const __m128i*)(blk + J));
+    const __m128i l = _mm_and_si128(_mm_srli_epi16(low, 2*(Group%4)), _mm_set1_epi8(3));
+    const __m128i h = _mm_xor_si128(
+        _mm_and_si128(_mm_srli_epi16(high, Group), _mm_set1_epi8(1)), _mm_set1_epi8(1));
+    const __m128i signed_bytes = _mm_sub_epi8(l, _mm_slli_epi16(h, 2));
+    const __m256i integers = _mm256_cvtepi8_epi32(signed_bytes);
+    __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(integers), _mm256_set1_ps(scales[Group*2+J/16]));
+    if (rounding) w = _mm256_cvtph_ps(_mm256_cvtps_ph(w, 0));
+    return _mm256_fmadd_ps(w, _mm256_loadu_ps(x + Group*32 + J), sum);
+}
+
 static inline __m256 q3_dot_block(const uint8_t* blk, const float* x,
                                   __m256 sum, bool round_weights) {
     const uint8_t* s = blk + 96;
@@ -32,23 +47,38 @@ static inline __m256 q3_dot_block(const uint8_t* blk, const float* x,
         const int high = (s[8+(j&3)] >> (2*(j>>2))) & 3;
         scales[j] = d * float((low | (high << 4)) - 32);
     }
-    const __m256i ones = _mm256_set1_epi32(1);
-    const __m256i threes = _mm256_set1_epi32(3);
-    for (int group = 0; group < 8; ++group) {
-        const uint8_t* low = blk + 32 + (group / 4) * 32;
-        const __m128i ls = _mm_cvtsi32_si128(2*(group%4));
-        const __m128i hs = _mm_cvtsi32_si128(group);
-        for (int j = 0; j < 32; j += 8) {
-            __m256i ql = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(low+j)));
-            __m256i qh = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(blk+j)));
-            ql = _mm256_and_si256(_mm256_srl_epi32(ql,ls),threes);
-            qh = _mm256_xor_si256(_mm256_and_si256(_mm256_srl_epi32(qh,hs),ones),ones);
-            const __m256i qi = _mm256_sub_epi32(ql,_mm256_slli_epi32(qh,2));
-            __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(qi),_mm256_set1_ps(scales[group*2+j/16]));
-            if (round_weights) w = _mm256_cvtph_ps(_mm256_cvtps_ph(w,0));
-            sum = _mm256_fmadd_ps(w,_mm256_loadu_ps(x+group*32+j),sum);
-        }
-    }
+    sum = q3_part<0, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<0, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<0, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<0, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<1, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<1, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<1, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<1, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<2, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<2, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<2, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<2, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<3, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<3, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<3, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<3, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<4, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<4, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<4, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<4, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<5, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<5, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<5, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<5, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<6, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<6, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<6, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<6, 24>(blk, x, scales, sum, round_weights);
+    sum = q3_part<7, 0>(blk, x, scales, sum, round_weights);
+    sum = q3_part<7, 8>(blk, x, scales, sum, round_weights);
+    sum = q3_part<7, 16>(blk, x, scales, sum, round_weights);
+    sum = q3_part<7, 24>(blk, x, scales, sum, round_weights);
     return sum;
 }
 
@@ -122,3 +152,6 @@ extern "C" __declspec(dllexport) int moe_quant_expert(
     } catch (...) { return -5; }
     return 0;
 }
+
+// Shared native library; independent DeltaNet entry point.
+#include "moe_delta.cpp"

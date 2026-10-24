@@ -18,6 +18,7 @@ class NativeExpert:
             C.c_void_p, C.c_int, C.c_int, C.c_void_p, C.c_int,
         ]
         self.function.restype = C.c_int
+        self.delta = NativeDelta(self.library) if hasattr(self.library, "moe_delta_heads") else None
 
     def forward(self, tensors, kinds, activation, hidden, intermediate):
         arrays = [np.frombuffer(tensors[name], np.uint8)
@@ -66,8 +67,35 @@ def load_native_expert(mode, library, device, tensor_types):
             reason = f"kernel unavailable ({error})"
         else:
             print("[Experts] native quantized CPU decode; OpenVINO prefill")
+            print("[DeltaNet] " + ("native FP32 decode recurrence" if result.delta is not None else "NumPy recurrence (rebuild native DLL to enable acceleration)"))
             return result
     if mode == "native":
         raise RuntimeError(reason)
     print(f"[Experts] OpenVINO decode: {reason}")
     return None
+
+
+class NativeDelta:
+    """All-head FP32 state update; called only during native decode."""
+
+    def __init__(self, library):
+        self.library = library
+        self.function = library.moe_delta_heads
+        self.function.argtypes = [C.c_void_p] * 7 + [C.c_int] * 3
+        self.function.restype = C.c_int
+
+    def forward(self, state, q, k, v, beta, gate):
+        if state.dtype != np.float32 or not state.flags.c_contiguous:
+            raise ValueError("DeltaNet state must be contiguous FP32")
+        nv, dv, dk = state.shape
+        arrays = [np.ascontiguousarray(a, dtype=np.float32)
+                  for a in (q, k, v, beta, gate)]
+        shapes = [(nv, dk), (nv, dk), (nv, dv), (nv,), (nv,)]
+        if any(a.shape != shape for a, shape in zip(arrays, shapes)):
+            raise ValueError("DeltaNet native input shape mismatch")
+        out = np.empty((nv, dv), np.float32)
+        pointers = [state.ctypes.data] + [a.ctypes.data for a in arrays] + [out.ctypes.data]
+        code = self.function(*pointers, nv, dk, dv)
+        if code:
+            raise RuntimeError(f"native DeltaNet failed with status {code}")
+        return out
