@@ -172,7 +172,7 @@ verify the source and terms for the exact file you obtained.
 py -3.14 chat.py default
 ```
 
-Enter a prompt after the `>` symbol. To exit, type `/esce` or press
+Enter a prompt after the `>` symbol. To exit, type `/exit` or press
 `Ctrl+C`.
 
 The preset runs the main model on the CPU and uses the Intel GPU for DeltaNet
