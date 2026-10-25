@@ -54,7 +54,7 @@ Il percorso di un token
     v      = x @ attn_v
     q, k   = QK-norm su head_dim (RMSNorm, eps 1e-6), PRIMA del RoPE
     q, k   = RoPE NeoX parziale sulle prime 64 dimensioni
-    k, v   = replicate ai gruppi (2 -> 16)
+    k, v   = condivise dai gruppi di teste query (2 -> 16)
     out    = softmax(q k^T / 16) v, con maschera causale
     out    = out * sigmoid(gate)
     out    = out @ attn_output
@@ -161,10 +161,11 @@ class KVCache:
         self.reset()
 
     def reset(self) -> None:
-        self.keys = np.zeros((0, self.num_kv_heads, self.head_dim),
-                             dtype=self.dtype)
-        self.values = np.zeros((0, self.num_kv_heads, self.head_dim),
-                               dtype=self.dtype)
+        shape = (self.max_seq_len, self.num_kv_heads, self.head_dim)
+        self._key_storage = np.empty(shape, dtype=self.dtype)
+        self._value_storage = np.empty(shape, dtype=self.dtype)
+        self.keys = self._key_storage[:0]
+        self.values = self._value_storage[:0]
         self.seq_len = 0
 
     @property
@@ -195,10 +196,11 @@ class KVCache:
                 "Su questo modello context_length e' 262144, quindi un "
                 "max_seq_len piu' piccolo va scelto di proposito.")
 
-        self.keys = np.concatenate([self.keys, k.astype(self.dtype, copy=False)],
-                                   axis=0)
-        self.values = np.concatenate(
-            [self.values, v.astype(self.dtype, copy=False)], axis=0)
+        stop = self.seq_len + n
+        self._key_storage[self.seq_len:stop] = k
+        self._value_storage[self.seq_len:stop] = v
+        self.keys = self._key_storage[:stop]
+        self.values = self._value_storage[:stop]
         self.seq_len += n
 
     def get(self) -> tuple[np.ndarray, np.ndarray]:
@@ -229,7 +231,7 @@ def grouped_attention(
     ``(n_kv_tokens, n_kv_head, head_dim)``. Restituisce
     ``(n_tokens, n_head * head_dim)``.
 
-    Il GQA e' ``np.repeat`` sulle teste: la testa di query ``h`` prende il
+    Il GQA usa gruppi senza copie replicate: la testa di query ``h`` prende il
     kv-head ``h // (n_head // n_kv)``. E' il mapping standard, diverso dal
     delta net che usa ``np.tile`` su ``h % n_k_heads``.
     """
@@ -248,9 +250,6 @@ def grouped_attention(
     kf = np.asarray(k, dtype=np.float32)
     vf = np.asarray(v, dtype=np.float32)
 
-    if group > 1:
-        kf = np.repeat(kf, group, axis=1)
-        vf = np.repeat(vf, group, axis=1)
     if timings is not None:
         timings["attention_cast_and_gqa"] = (
             timings.get("attention_cast_and_gqa", 0.0)
@@ -258,7 +257,14 @@ def grouped_attention(
         )
 
     started = time.perf_counter() if timings is not None else 0.0
-    scores = np.einsum("qhd,khd->qhk", qf, kf) * (1.0 / np.sqrt(head_dim))
+    # Keep the KV-head axis separate: no replicated K/V arrays. A Python
+    # scalar preserves FP32 here, including under NumPy 2 scalar promotion.
+    qs = qf.reshape(n_tokens, n_kv, group, head_dim).transpose(1, 0, 2, 3)
+    qs = qs.reshape(n_kv, n_tokens * group, head_dim)
+    raw_scores = np.matmul(qs, kf.transpose(1, 2, 0))
+    scores = raw_scores.reshape(n_kv, n_tokens, group, kf.shape[0])
+    scores = scores.transpose(1, 0, 2, 3).reshape(n_tokens, n_head, kf.shape[0])
+    scores *= float(1.0 / np.sqrt(head_dim))
 
     # Maschera causale: il token alla posizione assoluta seq_offset + q puo'
     # vedere i token fino a quella posizione inclusa. Con cache e decode il
@@ -288,7 +294,10 @@ def grouped_attention(
         )
 
     started = time.perf_counter() if timings is not None else 0.0
-    out = np.einsum("qhk,khd->qhd", p, vf)
+    ps = p.reshape(n_tokens, n_kv, group, vf.shape[0]).transpose(1, 0, 2, 3)
+    ps = ps.reshape(n_kv, n_tokens * group, vf.shape[0])
+    grouped_out = np.matmul(ps, vf.transpose(1, 0, 2))
+    out = grouped_out.reshape(n_kv, n_tokens, group, head_dim).transpose(1, 0, 2, 3)
     if timings is not None:
         timings["attention_values"] = (
             timings.get("attention_values", 0.0) + time.perf_counter() - started

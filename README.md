@@ -112,6 +112,68 @@ generation increased from 18.1 to 24.0 seconds. Cache misses, logical read
 bytes and physical storage traffic are different quantities; zero demand
 misses does not imply no prefetch waits or memory pressure.
 
+### Long-context update (AC power)
+
+The current CLI also uses **FP32 grouped matrix attention without replicated
+KV heads**, preallocated FP16 KV buffers, and **one BLAS thread**. Expert
+workers remain **4**, raw cache **320**, converted cache **1**. All tests in
+this section used the AC adapter. The last baseline run additionally
+confirmed Windows' AC performance mode and AcerSense Performance mode;
+earlier runs did not consistently record both settings.
+
+| Execution policy | Input tokens | Generated tokens | Prefill | Generation time | Effective decode rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Previous published attention | 1155 | 413 | 207.6 s | 374.8 s | 1.100 tok/s |
+| GQA without replicated KV, einsum | 1155 | 413 | 179.4 s | 259.3 s | 1.589 tok/s |
+| FP32 grouped matmul + preallocated KV + BLAS=1 | 1155 | 425 | 153.2 s | 236.3 s | 1.795 tok/s |
+
+The effective decode rate excludes the first token from prefill. These are
+separate manual runs, not a controlled isolated attribution of each gain.
+For the long FP32/KV run, full 64-step windows ranged from **1.680 to 1.912
+tok/s**, median step time was **539.3 ms** and p95 was **640.8 ms**. Shorter
+128-step trials ranged around **1.82–1.94 tok/s** overall, sometimes exceeding
+2 tok/s in a single window. **2+ tok/s sustained on long inputs remains a
+goal, not a demonstrated result.** FP32 attention changes rounding; synthetic
+comparisons with the replicated reference passed, but general answer-quality
+parity is not established.
+
+The CLI sets `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, and
+`BLIS_NUM_THREADS` before loading NumPy, using **1** by default. This affects
+the process only and leaves OpenVINO's explicit thread settings separate.
+To experiment, set `FLASH_MOE_BLAS_THREADS` before launching the CLI.
+When importing the model directly, configure BLAS before importing NumPy.
+Unrestricted BLAS threading severely slowed one grouped-matmul trial.
+KV storage is allocated for `--max-seq` up front: at 2048 positions, ten
+layers with 2 KV heads and head dimension 256 reserve about **40 MiB** in
+total. Very large maximum contexts therefore increase reserved storage.
+
+Rejected experiments include six expert workers, overlapping shared-expert
+execution, persistent GGUF handles, and mmap for the measured read workload.
+A SIMD Q3 scale variant remained experimental: a 62-pair decode A/B test
+showed **1.027x mean forward throughput**, zero compared-output error, and
+only **31/62 candidate wins**. It is not enabled in this update.
+
+#### Run a complete multiline input and check stability
+
+Save a UTF-8 input file, then run the normal chat:
+
+```powershell
+py -3.14 chat.py default --prompt-file .\input.txt --max-tokens 512 --max-seq 2048 --native-decode native
+```
+
+For timing windows, use the included benchmark, with the same input file:
+
+```powershell
+py -3.14 tools\bench_stability.py --prompt-file .\input.txt default --native-decode native --max-tokens 512 --max-seq 2048
+```
+
+The benchmark reports 64-step windows, median and p95 decode latency,
+excluding the first token. A partial final window is identified separately.
+The output limit does not force generation to continue past EOS. The input
+plus output budget must fit `--max-seq`; the CLI checks this before prefill.
+A final benchmark of this source integration should still be repeated on the
+Windows target; the measurements above used temporary equivalent variants.
+
 Automated tests check individual components such as attention,
 dequantization, and the DeltaNet path. They are not a full validation of
 answer quality or reliability across different PCs.
@@ -264,6 +326,7 @@ require the DLL.
 Tests are Python scripts. For example, run these from the project root:
 
 ```powershell
+py -3.14 tools\test_long_context.py
 py -3.14 tools\test_optimized_inference.py
 py -3.14 tools\test_attention.py
 py -3.14 tools\test_gated_deltanet_real.py

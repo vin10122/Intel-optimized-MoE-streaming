@@ -28,6 +28,7 @@ attention su OpenVINO FP16. Default GPU.
 from __future__ import annotations
 
 import argparse
+import os
 import io
 import sys
 import time
@@ -46,6 +47,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
+
+# Set BLAS policy before importing GGUF/NumPy. OpenVINO's explicit thread
+# settings are separate. The override is local to this Python process.
+_blas_threads = int(os.environ.get("FLASH_MOE_BLAS_THREADS", "1"))
+if _blas_threads < 1:
+    raise ValueError("FLASH_MOE_BLAS_THREADS must be positive")
+for _variable in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS"):
+    os.environ[_variable] = str(_blas_threads)
 
 import gguf  # noqa: E402
 from run_q4k_f16_openvino import dequant_to_f16  # noqa: E402
@@ -179,6 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="domanda da porre. Vuota: conversazione. "
                              "Usa 'default' come primo argomento per la "
                              "configurazione CPU/GPU consigliata.")
+    parser.add_argument("--prompt-file", type=Path,
+                        help="Legge il prompt UTF-8 completo, incluse le righe multiple.")
     parser.add_argument("--device", default="CPU",
                         choices=("CPU", "GPU", "NPU"),
                         help="dispositivo OpenVINO. Default CPU.")
@@ -259,6 +270,11 @@ def ask(model: Qwen3MoEModel, tok: GGUFTokenizer, prompt: str,
     all'output spunta un segnaposto al posto di un carattere.
     """
     ids = encode_user_turn(tok, prompt)
+    if len(ids) + args.max_tokens - 1 > args.max_seq:
+        raise ValueError(
+            f"Prompt ({len(ids)} token) + output richiesto superano "
+            f"--max-seq {args.max_seq}; aumenta il contesto o riduci l'output"
+        )
     stream = StreamingDetokenizer(tok)
     n = 0
     eos = False
@@ -344,6 +360,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.prompt and args.prompt[0].casefold() == "default":
         args.prompt = args.prompt[1:]
         # Parser defaults are the measured preset. Explicit flags win.
+    if args.prompt_file is not None:
+        if args.prompt:
+            raise ValueError("Usa --prompt-file oppure il prompt posizionale")
+        text = args.prompt_file.read_text(encoding="utf-8-sig").strip()
+        if not text:
+            raise ValueError("Il file del prompt e' vuoto")
+        args.prompt = [text]
     if args.cache < 1:
         raise ValueError("--cache deve essere positivo")
     if args.weight_cache is not None and args.weight_cache < 1:
