@@ -32,7 +32,6 @@ import os
 import io
 import sys
 import time
-import shutil
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -60,6 +59,7 @@ import gguf  # noqa: E402
 from run_q4k_f16_openvino import dequant_to_f16  # noqa: E402
 from flash_moe import Qwen3MoEModel, StreamingDetokenizer  # noqa: E402
 from flash_moe.paths import model_path  # noqa: E402
+from flash_moe.progress import StartupProgress  # noqa: E402
 from flash_moe.tokenizer import GGUFTokenizer  # noqa: E402
 
 
@@ -386,15 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     console = sys.stdout
-    progress_width = max(32, shutil.get_terminal_size((120, 20)).columns - 1)
-
-    def startup_progress(percent: int, label: str) -> None:
-        width = 24
-        filled = round(width * percent / 100)
-        bar = "#" * filled + "-" * (width - filled)
-        line = f"[{bar}] {percent:3d}%  {label}"
-        console.write("\r" + line[:progress_width].ljust(progress_width))
-        console.flush()
+    startup_progress = StartupProgress(console)
 
     print("[vin10122] AI client optimized for integrated Intel hardware",
           flush=True)
@@ -407,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
     startup_progress(0, f"Loading {path.name} on {args.device}")
     started = time.perf_counter()
     startup_logs = io.StringIO()
-    with redirect_stdout(startup_logs):
+    with startup_progress, redirect_stdout(startup_logs):
         model = Qwen3MoEModel(
             path, device=args.device, max_seq_len=args.max_seq,
             cache_capacity=args.cache, dequant_fn=dequant_to_f16,
@@ -464,7 +456,8 @@ def main(argv: list[str] | None = None) -> int:
                   flush=True)
 
     startup_progress(100, "Model ready")
-    console.write("\n")
+    if startup_progress.animated:
+        console.write("\n")
     console.write(startup_logs.getvalue())
     console.flush()
     print(f"Model initialization and preparation: "
