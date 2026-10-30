@@ -28,6 +28,7 @@ from flash_moe.model import Qwen3MoEModel
 from flash_moe.moe_layer import run_moe_sequence, run_moe_layer
 from flash_moe.native_expert import NativeExpert, load_native_expert
 from flash_moe.store import AsyncExpertStore
+from flash_moe.shared_expert import SharedExpert
 
 
 class OptimizedInferenceTests(unittest.TestCase):
@@ -112,6 +113,35 @@ class OptimizedInferenceTests(unittest.TestCase):
         compiled = backend._batch_compiled_models[(16, 16)]
         self.assertGreater(int(compiled.get_property("INFERENCE_NUM_THREADS")), 0)
         self.assertEqual(backend.inference_threads, 1)
+
+    def test_short_shared_batch_matches_scalar_and_respects_boundaries(self):
+        store = self.store(count=4)
+        backend = self.backend(store)
+        router = synthetic_router(16, 4, 2, seed=19)
+        shared = SharedExpert.__new__(SharedExpert)
+        shared.hidden_size = 16
+        shared.layers = {0: {
+            name: (self.rng.standard_normal(shape) * .1).astype(np.float32)
+            for name, shape in (("gate_inp", (16,)), ("gate", (8, 16)),
+                                ("up", (8, 16)), ("down", (16, 8)))
+        }}
+        # An independent per-token shared reference keeps the original MoE
+        # routing and reduction, without selecting the SharedExpert batch path.
+        scalar = SimpleNamespace(forward=shared.forward)
+        for count in (15, 16, 128, 129):
+            x = (self.rng.standard_normal((count, 16)) * .1).astype(np.float32)
+            expected = run_moe_sequence(0, x, router, backend, 16, 16, scalar)
+            with patch.object(shared, "forward_batch", wraps=shared.forward_batch) as batch:
+                actual = run_moe_sequence(0, x, router, backend, 16, 16, shared)
+                self.assertEqual(batch.call_count, int(16 <= count <= 128))
+            np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-5)
+        x = np.zeros(16, np.float32)
+        with patch.object(shared, "forward_batch", wraps=shared.forward_batch) as batch:
+            run_moe_layer(0, x, router, backend, 16, 16, shared)
+            batch.assert_not_called()
+        self.assertIsNone(shared.forward_batch(1, x.reshape(1, -1)))
+        with self.assertRaises(ValueError):
+            shared.forward_batch(0, x)
 
     def test_deltanet_batch_preserves_state_and_chunk_boundaries(self):
         h, nk, nv, dk, dv = 16, 2, 4, 8, 8
@@ -204,7 +234,8 @@ class OptimizedInferenceTests(unittest.TestCase):
         native = NativeExpert(NATIVE_PATH)
         block = {8: (32, 34), 11: (256, 110), 12: (256, 144),
                  13: (256, 176), 14: (256, 210)}
-        for kinds in ((8,11,12), (11,12,13), (12,13,14), (13,14,8), (14,8,11)):
+        for kinds in ((8,11,12), (11,12,13), (12,13,14), (13,14,8), (14,8,11),
+                      (12,12,14), (12,12,8), (11,11,11)):
             tensors, weights = {}, []
             for name, kind in zip(("gate", "up", "down"), kinds):
                 bs, size = block[kind]

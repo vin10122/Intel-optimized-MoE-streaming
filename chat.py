@@ -118,6 +118,7 @@ class LiveProfiler:
         wrap(model.backend, "_native_forward", "expert nativo (sottofase MoE)")
         if model.shared_expert is not None:
             wrap(model.shared_expert, "forward", "shared expert (sottofase MoE)")
+            wrap(model.shared_expert, "forward_batch", "shared expert (sottofase MoE)")
 
         original_forward_all = model._forward_all
 

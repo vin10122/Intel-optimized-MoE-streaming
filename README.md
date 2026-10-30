@@ -178,6 +178,51 @@ Automated tests check individual components such as attention,
 dequantization, and the DeltaNet path. They are not a full validation of
 answer quality or reliability across different PCs.
 
+### Short-prompt Q6 update (AC power)
+
+The integrated native kernel now computes Q6_K dot products directly with
+AVX2, retaining FP16 weight/graph rounding and the existing accumulation
+order. Shared experts run as FP32 matrix batches for **16–128 prompt tokens**,
+including the chat template. Longer inputs and single-token shared-expert
+decode retain their previous paths. The normal four-worker expert prefetch
+is retained.
+
+Manual Windows measurements on the same Intel Core Ultra 5 226V / Arc 130V
+PC, **with the AC adapter connected**, used repeated requests in the same
+process. Each row below generated the same 89-token response from a
+94-token input:
+
+| Variant / repeated run | Prefill | Generation | CLI rate | Approx. effective decode rate |
+|---|---:|---:|---:|---:|
+| Batched shared prefill, previous native kernel | 19.1 s | 38.0 s | 2.344 tok/s | 2.32 tok/s |
+| Batched shared prefill + fused Q6, run 1 | 19.0 s | 35.4 s | 2.513 tok/s | 2.49 tok/s |
+| Batched shared prefill + fused Q6, run 2 | 18.8 s | 35.0 s | 2.545 tok/s | 2.51 tok/s |
+| Batched shared prefill + fused Q6, later run | 20.2 s | 37.6 s | 2.368 tok/s | 2.34 tok/s |
+
+Effective rates use 88 decode steps, excluding the first token supplied by
+prefill; generation timing also includes sampling. These are separate manual
+runs, not a controlled paired benchmark. Warm-up, file cache and PC conditions
+affect results: **3 tok/s and these rates on long prompts are not established**.
+The shared batch affects prefill only; it does not directly accelerate decode.
+
+All nine Q6-layer checks matched the previous native expert output bit for
+bit for the checked real-expert inputs. Shared-expert batch checks across
+40 layers had relative error below `1e-6`; batching can change rounding and
+does not establish general answer-quality parity. Synthetic native checks and
+integration tests also pass; final source integration should be checked again
+on the target Windows PC.
+
+The Q4+Q6 and direct-read-without-prefetch experiments are **not enabled**:
+their measured whole-chat runs did not improve the selected Q6 configuration.
+No temporary Python launchers are needed after updating. Close running chats,
+update and rebuild the native decode DLL once:
+
+```powershell
+git pull --ff-only origin master
+scripts\compile_native_expert.bat
+py -3.14 chat.py default --native-decode native --expert-workers 4 --max-tokens 128
+```
+
 ## Requirements
 
 - 64-bit Windows 10 or 11.
@@ -289,7 +334,8 @@ py -3.14 chat.py default --native-decode native
 
 After updating the C++ sources, close running chats and rebuild with
 `scripts\compile_native_expert.bat`; a DLL built before this update does not
-contain the new Q3_K code or DeltaNet entry point. Recompilation is not
+contain the latest fused Q6_K code (and older builds may lack the Q3_K
+optimization or DeltaNet entry point). Recompilation is not
 needed merely because you reopened PowerShell. Startup reports whether the
 native DeltaNet entry point is present; older DLLs retain NumPy recurrence.
 

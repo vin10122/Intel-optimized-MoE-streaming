@@ -197,6 +197,27 @@ class SharedExpert:
     def has(self, layer: int) -> bool:
         return layer in self.layers
 
+    def forward_batch(self, layer: int, activations: np.ndarray
+                      ) -> np.ndarray | None:
+        """Shared contribution for short prefill, reusing weights across tokens."""
+        weights = self.layers.get(layer)
+        if weights is None:
+            return None
+        x = np.ascontiguousarray(activations, dtype=np.float32)
+        if x.ndim != 2 or x.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"shared activations must have shape (tokens, {self.hidden_size})"
+            )
+        gate = _sigmoid(
+            x @ np.asarray(weights["gate_inp"], dtype=np.float32).reshape(-1)
+        )
+        g = x @ np.asarray(weights["gate"], dtype=np.float32).T
+        u = x @ np.asarray(weights["up"], dtype=np.float32).T
+        out = ((g * _sigmoid(g)) * u) @ np.asarray(
+            weights["down"], dtype=np.float32
+        ).T
+        return (out * gate[:, None]).astype(np.float32)
+
     def forward(self, layer: int, activation: list[float] | np.ndarray
                 ) -> np.ndarray | None:
         """Contributo dello shared expert al layer, gia' scalato dal gate.

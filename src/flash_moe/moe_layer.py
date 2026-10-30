@@ -33,6 +33,7 @@ import numpy as np
 
 from .key import ExpertKey
 from .router import ExpertRouter
+from .shared_expert import SharedExpert
 
 
 def run_moe_layer(
@@ -171,16 +172,24 @@ def run_moe_sequence(
         if prefetch_many is not None:
             prefetch_many(keys[index + 1:index + 1 + lookahead])
 
+    # Keep the tested optimization bounded to short prompts. Decode and
+    # longer inputs retain the original shared-expert path.
+    batch_shared = (16 <= token_count <= 128
+                    and isinstance(shared_expert, SharedExpert))
     result = np.zeros((token_count, hidden_size), dtype=np.float32)
     for token_index, routes in enumerate(routed):
         for slot, (_, weight) in enumerate(routes):
             result[token_index] += (
                 weight * batch_outputs[token_index, slot]
             )
-        if shared_expert is not None:
+        if shared_expert is not None and not batch_shared:
             shared_out = shared_expert.forward(
                 layer, activations[token_index]
             )
             if shared_out is not None:
                 result[token_index] += shared_out
+    if batch_shared:
+        shared_out = shared_expert.forward_batch(layer, activations)
+        if shared_out is not None:
+            result += shared_out
     return result

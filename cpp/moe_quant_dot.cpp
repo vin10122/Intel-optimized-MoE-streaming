@@ -82,6 +82,62 @@ static inline __m256 q3_dot_block(const uint8_t* blk, const float* x,
     return sum;
 }
 
+// Direct Q6_K dot product: preserve FP16 rounding and FMA order.
+
+template<int G, int J>
+static inline __m256 q6_part(const uint8_t* b, const float* x,
+                             const float* scales, __m256 sum, bool rounding) {
+    const __m128i lo = _mm_loadl_epi64((const __m128i*)(b + (G/4)*64 + (G%2)*32 + J));
+    const __m128i hi = _mm_loadl_epi64((const __m128i*)(b + 128 + (G/4)*32 + J));
+    const __m128i l = _mm_and_si128(_mm_srli_epi16(lo, (G%4 >= 2) ? 4 : 0), _mm_set1_epi8(15));
+    const __m128i h = _mm_and_si128(_mm_srli_epi16(hi, 2*(G%4)), _mm_set1_epi8(3));
+    const __m128i q = _mm_sub_epi8(_mm_or_si128(l, _mm_slli_epi16(h, 4)), _mm_set1_epi8(32));
+    __m256 w = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q)),
+                            _mm256_set1_ps(scales[G*2+J/16]));
+    if (rounding) w = _mm256_cvtph_ps(_mm256_cvtps_ph(w, 0));
+    return _mm256_fmadd_ps(w, _mm256_loadu_ps(x + G*32 + J), sum);
+}
+static inline __m256 q6_dot_block(const uint8_t* b, const float* x,
+                                  __m256 sum, bool rounding) {
+    const float d = f16_to_f32(uint16_t(b[208] | (b[209] << 8)));
+    const int8_t* s = (const int8_t*)(b + 192);
+    float scales[16];
+    for (int j = 0; j < 16; ++j) scales[j] = d * float(s[j]);
+    sum = q6_part<0, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<0, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<0, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<0, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<1, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<1, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<1, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<1, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<2, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<2, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<2, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<2, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<3, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<3, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<3, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<3, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<4, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<4, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<4, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<4, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<5, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<5, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<5, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<5, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<6, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<6, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<6, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<6, 24>(b, x, scales, sum, rounding);
+    sum = q6_part<7, 0>(b, x, scales, sum, rounding);
+    sum = q6_part<7, 8>(b, x, scales, sum, rounding);
+    sum = q6_part<7, 16>(b, x, scales, sum, rounding);
+    sum = q6_part<7, 24>(b, x, scales, sum, rounding);
+    return sum;
+}
+
 // Materialize at most one quantization block, kept on the stack/in cache.
 // round_weights reproduces the existing quantized -> F16 weight values.
 static float quant_dot(int type, const uint8_t* row, const float* x,
@@ -92,6 +148,10 @@ static float quant_dot(int type, const uint8_t* row, const float* x,
     for (int offset = 0; offset < columns; offset += bs, row += pb) {
         if (type == GGML_TYPE_Q3_K) {
             sum = q3_dot_block(row, x + offset, sum, round_weights);
+            continue;
+        }
+        if (type == GGML_TYPE_Q6_K) {
+            sum = q6_dot_block(row, x + offset, sum, round_weights);
             continue;
         }
         decode_block(type, row, tmp);
